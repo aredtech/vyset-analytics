@@ -1,0 +1,28 @@
+services:
+  analytics-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: analytics-service
+    env_file: .env
+    ports:
+      - "8069:8069"
+    restart: unless-stopped
+    volumes:
+      - ./app:/app/app
+      - analytics_snapshots:/app/snapshots
+    networks:
+      - vms_network
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://vms_admin:AIvan0987@db:5432/vms_analytics_db}
+      - SNAPSHOTS_DIR=${SNAPSHOTS_DIR:-/app/snapshots}
+      - ENABLE_SNAPSHOTS=${ENABLE_SNAPSHOTS:-true}
+
+volumes:
+  analytics_snapshots:
+    driver: local
+
+networks:
+  vms_network:
+    external: true
+
