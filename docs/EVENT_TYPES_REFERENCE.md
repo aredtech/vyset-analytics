@@ -223,6 +223,23 @@ Published when a license plate is detected and recognized.
 }
 ```
 
+### 3.4 License Plate with Vehicle Class
+
+```json
+{
+  "event_type": "anpr",
+  "camera_id": "gate-cam-01",
+  "timestamp": "2025-10-09T14:32:10.123456Z",
+  "anpr_result": {
+    "license_plate": "GHI3456",
+    "confidence": 0.9234567,
+    "region": "TX",
+    "vehicle_class": "truck"
+  },
+  "frame_number": 9013
+}
+```
+
 ---
 
 ## Field Specifications
@@ -269,6 +286,7 @@ Published when a license plate is detected and recognized.
 | `anpr_result.license_plate` | string | Yes | Detected license plate text |
 | `anpr_result.confidence` | float | Yes | Recognition confidence (0.0-1.0) |
 | `anpr_result.region` | string or null | Yes | Region/state code or null if not detected |
+| `anpr_result.vehicle_class` | string or null | No | YOLO class of the vehicle (e.g., car, truck, bus, motorcycle) or null if not detected |
 
 ---
 

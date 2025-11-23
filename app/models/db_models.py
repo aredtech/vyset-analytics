@@ -31,7 +31,7 @@ class EventRecord(Base):
     # Event-specific data stored as JSON
     # For detection: {detections: [...], model_info: {...}}
     # For motion: {motion_intensity: float, affected_area_percentage: float}
-    # For ANPR: {anpr_result: {license_plate: str, confidence: float, region: str}}
+    # For ANPR: {anpr_result: {license_plate: str, confidence: float, region: str, vehicle_class: str}}
     # For tracking: {track_id: int, tracking_action: str, class_name: str, confidence: float, bounding_box: {...}, dwell_time_seconds: float}
     event_data = Column(JSON, nullable=False)
     

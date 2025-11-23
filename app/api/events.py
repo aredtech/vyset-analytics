@@ -75,6 +75,7 @@ async def list_events(
     camera_id: Optional[str] = Query(None, description="Filter by camera ID"),
     event_type: Optional[str] = Query(None, description="Filter by event type (detection, motion, anpr, tracking)"),
     object_class: Optional[str] = Query(None, description="Filter by object class (e.g., person, car, truck, garbage)"),
+    license_plate: Optional[str] = Query(None, description="Filter by license plate (supports regex pattern)"),
     start_time: Optional[datetime] = Query(None, description="Start timestamp (ISO format)"),
     end_time: Optional[datetime] = Query(None, description="End timestamp (ISO format)"),
     page: int = Query(1, ge=1, description="Page number"),
@@ -88,6 +89,7 @@ async def list_events(
         camera_id: Filter by camera ID
         event_type: Filter by event type
         object_class: Filter by object class (e.g., person, car, truck, garbage)
+        license_plate: Filter by license plate using regex pattern (searches in event_data->anpr_result->license_plate)
         start_time: Start timestamp for filtering
         end_time: End timestamp for filtering
         page: Page number (1-indexed)
@@ -111,6 +113,17 @@ async def list_events(
             # Filter by class_name in the event_data JSON field (case-insensitive using ILIKE)
             logger.info(f"Adding object_class filter: '{object_class}'")
             filters.append(text("LOWER(event_data->>'class_name') = LOWER(:object_class)").bindparams(object_class=object_class))
+        if license_plate:
+            # Complex regex-based search for license plates
+            # This searches in event_data->anpr_result->license_plate using PostgreSQL regex matching
+            # Supports partial matches and regex patterns
+            logger.info(f"Adding license_plate filter with pattern: '{license_plate}'")
+            # Use ~* for case-insensitive regex match in PostgreSQL
+            # Handle null anpr_result gracefully
+            filters.append(
+                text("event_data->'anpr_result'->>'license_plate' IS NOT NULL AND event_data->'anpr_result'->>'license_plate' ~* :license_pattern")
+                .bindparams(license_pattern=license_plate)
+            )
         if start_time:
             filters.append(EventRecord.timestamp >= start_time)
         if end_time:

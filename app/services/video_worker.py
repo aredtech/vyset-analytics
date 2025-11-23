@@ -724,6 +724,28 @@ class CameraWorker:
         if anpr_event:
             # Apply event filtering to prevent duplicate ANPR events
             if self.event_filter.should_publish_anpr(anpr_event):
+                # Capture vehicle class from tracking events or active tracks
+                vehicle_class = None
+                if tracking_events:
+                    # Find vehicle class from tracking events (prioritize "entered" events)
+                    for event in tracking_events:
+                        if event.class_name.lower() in VEHICLE_CLASSES:
+                            vehicle_class = event.class_name
+                            # Prefer "entered" events as they're more recent
+                            if event.tracking_action == "entered":
+                                break
+                
+                # If not found in tracking events, check active tracks
+                if not vehicle_class and hasattr(self.object_detector, 'active_tracks'):
+                    for track_id, tracked_obj in self.object_detector.active_tracks.items():
+                        if tracked_obj.class_name.lower() in VEHICLE_CLASSES:
+                            vehicle_class = tracked_obj.class_name
+                            break
+                
+                # Update anpr_result with vehicle class
+                if vehicle_class:
+                    anpr_event.anpr_result.vehicle_class = vehicle_class
+                
                 # Save snapshot
                 snapshot_path = snapshot_manager.save_anpr_snapshot(
                     frame=frame,
@@ -750,7 +772,8 @@ class CameraWorker:
                 )
                 
                 if event_id:
-                    logger.info(f"Camera {self.camera_id}: Saved and published ANPR event for frame #{self.frame_count}: {anpr_event.anpr_result.license_plate} (confidence: {anpr_event.anpr_result.confidence:.2f}, event_id={event_id}) in {anpr_time:.3f}s")
+                    vehicle_info = f", vehicle: {vehicle_class}" if vehicle_class else ""
+                    logger.info(f"Camera {self.camera_id}: Saved and published ANPR event for frame #{self.frame_count}: {anpr_event.anpr_result.license_plate} (confidence: {anpr_event.anpr_result.confidence:.2f}{vehicle_info}, event_id={event_id}) in {anpr_time:.3f}s")
                 else:
                     logger.error(f"Camera {self.camera_id}: Failed to save ANPR event")
             else:

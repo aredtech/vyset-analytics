@@ -125,6 +125,7 @@ class ANPRResult(BaseModel):
     license_plate: str
     confidence: float = Field(ge=0.0, le=1.0)
     region: Optional[str] = None
+    vehicle_class: Optional[str] = None  # YOLO class of the vehicle (e.g., car, truck, bus, motorcycle)
 
 
 class ANPREvent(BaseModel):
