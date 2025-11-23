@@ -108,6 +108,13 @@ class CameraWorker:
         logger.debug(f"Initializing CameraWorker for camera {config.camera_id}")
         
         self.config = config
+        
+        # Replace localhost with mediamtx for dockerized environment
+        if "localhost" in self.config.stream_url:
+            old_url = self.config.stream_url
+            self.config.stream_url = self.config.stream_url.replace("localhost", "mediamtx")
+            logger.info(f"Camera {config.camera_id}: Replaced localhost with mediamtx in stream URL. Old: {old_url}, New: {self.config.stream_url}")
+            
         self.camera_id = config.camera_id
         self.running = False
         self.thread = None
@@ -274,21 +281,65 @@ class CameraWorker:
     
     def _process_stream(self):
         """Main processing loop for camera stream."""
-        # Connect to stream
-        if not self._connect_to_stream():
-            logger.error(f"Camera {self.camera_id}: Initial connection failed, exiting worker")
+        # Retry connection every 10 seconds until successful
+        logger.info(f"Camera {self.camera_id}: Attempting initial connection...")
+        while self.running:
+            if self._connect_to_stream():
+                logger.info(f"Camera {self.camera_id}: Initial connection successful")
+                break
+            else:
+                logger.warning(f"Camera {self.camera_id}: Initial connection failed, retrying in 10 seconds...")
+                # Wait 10 seconds before retrying, but check self.running periodically
+                for _ in range(10):
+                    if not self.running:
+                        logger.info(f"Camera {self.camera_id}: Worker stopped during connection retry")
+                        return
+                    time.sleep(1)
+        
+        # If we exited the connection loop because running is False, cleanup and return
+        if not self.running:
+            logger.info(f"Camera {self.camera_id}: Worker stopped before connection established")
             return
         
         frame_skip_counter = 0
         last_frame_time = time.time()
         target_frame_interval = 1.0 / self.config.parameters.max_fps
-        consecutive_failures = 0
-        max_consecutive_failures = 10
         
         logger.info(f"Camera {self.camera_id}: Starting frame processing loop (max_fps={self.config.parameters.max_fps}, frame_skip={self.config.parameters.frame_skip})")
         
         while self.running:
             try:
+                # Check if stream is still open
+                if self.cap is None or not self.cap.isOpened():
+                    logger.warning(f"Camera {self.camera_id}: Stream connection lost, attempting to reconnect...")
+                    if self.cap:
+                        self.cap.release()
+                    # Retry connection every 10 seconds
+                    while self.running:
+                        if self._connect_to_stream():
+                            logger.info(f"Camera {self.camera_id}: Reconnected successfully")
+                            break
+                        else:
+                            logger.warning(f"Camera {self.camera_id}: Reconnection failed, retrying in 10 seconds...")
+                            # Wait 10 seconds before retrying, but check self.running periodically
+                            for _ in range(10):
+                                if not self.running:
+                                    logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection retry")
+                                    return
+                                time.sleep(1)
+                    
+                    # If we exited the reconnection loop because running is False, cleanup and return
+                    if not self.running:
+                        logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection")
+                        if self.cap:
+                            self.cap.release()
+                        return
+                    
+                    # Reset frame counter after reconnection
+                    frame_skip_counter = 0
+                    last_frame_time = time.time()
+                    continue
+                
                 # Enforce max FPS
                 current_time = time.time()
                 elapsed = current_time - last_frame_time
@@ -300,21 +351,37 @@ class CameraWorker:
                 ret, frame = self.cap.read()
                 
                 if not ret or frame is None:
-                    consecutive_failures += 1
-                    logger.warning(f"Camera {self.camera_id}: Failed to read frame (attempt {consecutive_failures}/{max_consecutive_failures}), reconnecting...")
+                    logger.warning(f"Camera {self.camera_id}: Failed to read frame, will reconnect...")
+                    # Release current connection
+                    if self.cap:
+                        self.cap.release()
+                    # Retry connection every 10 seconds
+                    while self.running:
+                        if self._connect_to_stream():
+                            logger.info(f"Camera {self.camera_id}: Reconnected after frame read failure")
+                            break
+                        else:
+                            logger.warning(f"Camera {self.camera_id}: Reconnection failed, retrying in 10 seconds...")
+                            # Wait 10 seconds before retrying, but check self.running periodically
+                            for _ in range(10):
+                                if not self.running:
+                                    logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection retry")
+                                    return
+                                time.sleep(1)
                     
-                    if consecutive_failures >= max_consecutive_failures:
-                        logger.error(f"Camera {self.camera_id}: Too many consecutive failures, exiting worker")
-                        break
+                    # If we exited the reconnection loop because running is False, cleanup and return
+                    if not self.running:
+                        logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection")
+                        if self.cap:
+                            self.cap.release()
+                        return
                     
-                    self.cap.release()
-                    time.sleep(5)
-                    if not self._connect_to_stream():
-                        break
+                    # Reset frame counter after reconnection
+                    frame_skip_counter = 0
+                    last_frame_time = time.time()
                     continue
                 
                 # Successfully read frame
-                consecutive_failures = 0  # Reset failure counter
                 self.frame_count += 1
                 last_frame_time = time.time()
                 
@@ -332,19 +399,50 @@ class CameraWorker:
                 self._process_frame(frame)
                 
             except Exception as e:
-                consecutive_failures += 1
-                logger.error(f"Camera {self.camera_id}: Error in processing loop (attempt {consecutive_failures}/{max_consecutive_failures}): {e}", exc_info=True)
+                logger.error(f"Camera {self.camera_id}: Error in processing loop: {e}", exc_info=True)
                 
-                if consecutive_failures >= max_consecutive_failures:
-                    logger.error(f"Camera {self.camera_id}: Too many consecutive errors, exiting worker")
-                    break
-                    
-                time.sleep(1)
+                # On exception, try to reconnect
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                
+                # Retry connection every 10 seconds
+                while self.running:
+                    if self._connect_to_stream():
+                        logger.info(f"Camera {self.camera_id}: Reconnected after exception")
+                        break
+                    else:
+                        logger.warning(f"Camera {self.camera_id}: Reconnection failed after exception, retrying in 10 seconds...")
+                        # Wait 10 seconds before retrying, but check self.running periodically
+                        for _ in range(10):
+                            if not self.running:
+                                logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection retry after exception")
+                                return
+                            time.sleep(1)
+                
+                # If we exited the reconnection loop because running is False, cleanup and return
+                if not self.running:
+                    logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection after exception")
+                    if self.cap:
+                        try:
+                            self.cap.release()
+                        except:
+                            pass
+                    return
+                
+                # Reset frame counter after reconnection
+                frame_skip_counter = 0
+                last_frame_time = time.time()
         
         # Cleanup
         logger.info(f"Camera {self.camera_id}: Exiting processing loop, cleaning up...")
         if self.cap:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except:
+                pass
     
     def _process_frame(self, frame):
         """
