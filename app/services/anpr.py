@@ -1,7 +1,6 @@
-import easyocr
 import numpy as np
-import re
-from typing import Optional, List
+from typing import Optional
+from fast_alpr import ALPR
 from app.models.event_models import ANPREvent, ANPRResult
 from app.utils.logger import get_logger
 
@@ -9,50 +8,34 @@ logger = get_logger(__name__)
 
 
 class ANPRDetector:
-    """Automatic Number Plate Recognition service."""
+    """Automatic Number Plate Recognition service using fast-alpr."""
     
-    def __init__(self, languages: List[str] = None):
+    def __init__(self, detector_model: str = "yolo-v9-t-384-license-plate-end2end", 
+                 ocr_model: str = "cct-xs-v1-global-model"):
         """
-        Initialize ANPR detector.
+        Initialize ANPR detector using fast-alpr.
         
         Args:
-            languages: List of languages for OCR (default: ['en'])
+            detector_model: License plate detection model name
+            ocr_model: OCR model name for reading plates
         """
-        self.languages = languages or ['en']
-        self.reader = None
+        self.detector_model = detector_model
+        self.ocr_model = ocr_model
+        self.alpr = None
         self._load_model()
     
     def _load_model(self):
-        """Load EasyOCR model."""
+        """Load fast-alpr model."""
         try:
-            logger.info(f"Loading EasyOCR model for languages: {self.languages}")
-            self.reader = easyocr.Reader(self.languages, gpu=False)
-            logger.info("EasyOCR model loaded successfully")
+            logger.info(f"Loading fast-alpr model (detector: {self.detector_model}, OCR: {self.ocr_model})")
+            self.alpr = ALPR(
+                detector_model=self.detector_model,
+                ocr_model=self.ocr_model
+            )
+            logger.info("fast-alpr model loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load EasyOCR model: {e}")
+            logger.error(f"Failed to load fast-alpr model: {e}")
             raise
-    
-    def _is_valid_plate(self, text: str) -> bool:
-        """
-        Check if text looks like a license plate.
-        
-        Args:
-            text: OCR text result
-            
-        Returns:
-            True if text looks like a license plate
-        """
-        # Remove spaces and special characters
-        cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-        
-        # Basic validation: 4-8 characters, mix of letters and numbers
-        if len(cleaned) < 4 or len(cleaned) > 8:
-            return False
-        
-        has_letter = bool(re.search(r'[A-Z]', cleaned))
-        has_number = bool(re.search(r'[0-9]', cleaned))
-        
-        return has_letter and has_number
     
     def detect(
         self,
@@ -74,28 +57,52 @@ class ANPRDetector:
             ANPREvent if plate detected, None otherwise
         """
         try:
-            # Run OCR
-            results = self.reader.readtext(frame)
+            # Run fast-alpr prediction
+            alpr_results = self.alpr.predict(frame)
             
             # Find best license plate candidate
             best_plate = None
             best_confidence = 0.0
             
-            for (bbox, text, conf) in results:
-                # Check if looks like a license plate
-                if self._is_valid_plate(text) and conf > confidence_threshold:
-                    if conf > best_confidence:
-                        best_confidence = conf
-                        # Clean up the text
-                        cleaned_text = re.sub(r'[^A-Z0-9]', '', text.upper())
-                        best_plate = cleaned_text
+            # Handle both single result and list of results
+            if alpr_results:
+                # Convert single result to list for uniform processing
+                if not isinstance(alpr_results, list):
+                    alpr_results = [alpr_results]
+                
+                # Process each result
+                for result in alpr_results:
+                    # fast-alpr returns ALPRResult with ocr and detection attributes
+                    # Extract plate text and confidence from ocr result
+                    plate_text = None
+                    confidence = 0.0
+                    
+                    # Check for ocr attribute (fast-alpr structure)
+                    if hasattr(result, 'ocr'):
+                        ocr_result = result.ocr
+                        if hasattr(ocr_result, 'text') and hasattr(ocr_result, 'confidence'):
+                            plate_text = ocr_result.text
+                            confidence = ocr_result.confidence
+                        else:
+                            logger.warning(f"ANPR: Result ocr missing text or confidence: {ocr_result}")
+                    # Fallback: check for direct license_plate and confidence attributes (legacy format)
+                    elif hasattr(result, 'license_plate') and hasattr(result, 'confidence'):
+                        plate_text = result.license_plate
+                        confidence = result.confidence
+                    else:
+                        logger.warning(f"ANPR: Result missing expected attributes: {result}")
+                    
+                    # Check confidence threshold and update best plate
+                    if plate_text and confidence > confidence_threshold and confidence > best_confidence:
+                        best_confidence = confidence
+                        best_plate = plate_text
             
             # Return event if plate found
             if best_plate:
                 anpr_result = ANPRResult(
                     license_plate=best_plate,
                     confidence=best_confidence,
-                    region=None  # Can be enhanced with region detection
+                    region=None  # fast-alpr may provide region in future versions
                 )
                 
                 return ANPREvent(
@@ -107,6 +114,6 @@ class ANPRDetector:
             return None
             
         except Exception as e:
-            logger.error(f"ANPR detection error for camera {camera_id}: {e}")
+            logger.error(f"ANPR detection error for camera {camera_id}: {e}", exc_info=True)
             return None
 

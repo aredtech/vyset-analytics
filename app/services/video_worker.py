@@ -22,6 +22,9 @@ logger = get_logger(__name__)
 # This helps avoid UDP packet loss and timeout issues
 os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
 
+# Vehicle classes that should trigger ANPR detection
+VEHICLE_CLASSES = {'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'van', 'suv'}
+
 
 def save_and_publish_event(
     event_type: str,
@@ -163,9 +166,16 @@ class CameraWorker:
             logger.debug(f"Camera {self.camera_id}: GarbageDetector initialized with tracking={config.parameters.enable_garbage_tracking}")
         
         if config.parameters.enable_anpr:
-            logger.debug(f"Camera {self.camera_id}: Creating ANPRDetector")
-            self.anpr_detector = ANPRDetector()
-            logger.debug(f"Camera {self.camera_id}: ANPRDetector initialized")
+            logger.info(f"Camera {self.camera_id}: Creating ANPRDetector")
+            try:
+                self.anpr_detector = ANPRDetector()
+                logger.info(f"Camera {self.camera_id}: ANPRDetector initialized successfully")
+            except Exception as e:
+                logger.error(f"Camera {self.camera_id}: Failed to initialize ANPRDetector: {e}")
+                self.anpr_detector = None
+        else:
+            logger.info(f"Camera {self.camera_id}: ANPR is disabled (enable_anpr=False)")
+            self.anpr_detector = None
         
         logger.info(f"Camera {self.camera_id}: CameraWorker initialized successfully (stream_url={config.stream_url})")
     
@@ -454,6 +464,10 @@ class CameraWorker:
         logger.debug(f"Camera {self.camera_id}: Processing frame #{self.frame_count} (shape: {frame.shape})")
         start_time = time.time()
         
+        # Track if any vehicles are detected in this frame (for ANPR)
+        vehicles_detected = False
+        tracking_events = []
+        
         # Object detection with tracking
         if self.object_detector and self.config.parameters.enable_object_detection:
             logger.debug(f"Camera {self.camera_id}: Running object detection with tracking on frame #{self.frame_count}")
@@ -466,6 +480,20 @@ class CameraWorker:
                 target_classes=self.config.parameters.detection_classes
             )
             detect_time = time.time() - detect_start
+            
+            # Check if any vehicles are detected in tracking events (new entries)
+            if tracking_events:
+                for event in tracking_events:
+                    if event.class_name.lower() in VEHICLE_CLASSES:
+                        vehicles_detected = True
+                        break
+            
+            # Also check active tracks for vehicles (vehicles already being tracked)
+            if not vehicles_detected and hasattr(self.object_detector, 'active_tracks'):
+                for track_id, tracked_obj in self.object_detector.active_tracks.items():
+                    if tracked_obj.class_name.lower() in VEHICLE_CLASSES:
+                        vehicles_detected = True
+                        break
             
             # Save and publish all tracking events (entered/left) to database and Redis Pub/Sub
             if tracking_events:
@@ -670,53 +698,63 @@ class CameraWorker:
             else:
                 logger.debug(f"Camera {self.camera_id}: No garbage detected in frame #{self.frame_count} ({garbage_time:.3f}s)")
         
-        # ANPR detection
+        # ANPR detection - only run if vehicles are detected
         if self.anpr_detector and self.config.parameters.enable_anpr:
-            logger.debug(f"Camera {self.camera_id}: Running ANPR detection on frame #{self.frame_count}")
-            anpr_start = time.time()
-            anpr_event = self.anpr_detector.detect(
-                frame=frame,
-                camera_id=self.camera_id,
-                frame_number=self.frame_count
-            )
-            anpr_time = time.time() - anpr_start
-            
-            if anpr_event:
-                # Apply event filtering to prevent duplicate ANPR events
-                if self.event_filter.should_publish_anpr(anpr_event):
-                    # Save snapshot
-                    snapshot_path = snapshot_manager.save_anpr_snapshot(
+            if vehicles_detected:
+                anpr_start = time.time()
+                try:
+                    anpr_event = self.anpr_detector.detect(
                         frame=frame,
                         camera_id=self.camera_id,
-                        anpr_result=anpr_event.anpr_result,
-                        timestamp=datetime.utcnow(),
-                        bounding_box=None  # Can be enhanced to get bbox from OCR
+                        frame_number=self.frame_count
                     )
-                    
-                    # Prepare event data
-                    event_data = {
-                        "anpr_result": anpr_event.anpr_result.model_dump()
-                    }
-                    
-                    # Save to database and publish to Redis Pub/Sub
-                    event_id = save_and_publish_event(
-                        event_type="anpr",
-                        camera_id=self.camera_id,
-                        timestamp=anpr_event.timestamp,
-                        frame_number=self.frame_count,
-                        snapshot_path=snapshot_path,
-                        event_data=event_data,
-                        camera_name=self.config.camera_name
-                    )
-                    
-                    if event_id:
-                        logger.info(f"Camera {self.camera_id}: Saved and published ANPR event for frame #{self.frame_count}: {anpr_event.anpr_result.license_plate} (confidence: {anpr_event.anpr_result.confidence:.2f}, event_id={event_id}) in {anpr_time:.3f}s")
-                    else:
-                        logger.error(f"Camera {self.camera_id}: Failed to save ANPR event")
-                else:
-                    logger.debug(f"Camera {self.camera_id}: ANPR event filtered (duplicate plate in cooldown) for frame #{self.frame_count}")
+                    anpr_time = time.time() - anpr_start
+                except Exception as e:
+                    logger.error(f"Camera {self.camera_id}: ANPR detection error on frame #{self.frame_count}: {e}", exc_info=True)
+                    anpr_event = None
+                    anpr_time = time.time() - anpr_start
             else:
-                logger.debug(f"Camera {self.camera_id}: No license plates detected in frame #{self.frame_count} ({anpr_time:.3f}s)")
+                anpr_event = None
+                anpr_time = 0.0
+        else:
+            anpr_event = None
+            anpr_time = 0.0
+        
+        # Process ANPR event if detected (regardless of how we got here)
+        if anpr_event:
+            # Apply event filtering to prevent duplicate ANPR events
+            if self.event_filter.should_publish_anpr(anpr_event):
+                # Save snapshot
+                snapshot_path = snapshot_manager.save_anpr_snapshot(
+                    frame=frame,
+                    camera_id=self.camera_id,
+                    anpr_result=anpr_event.anpr_result,
+                    timestamp=datetime.utcnow(),
+                    bounding_box=None  # Can be enhanced to get bbox from OCR
+                )
+                
+                # Prepare event data
+                event_data = {
+                    "anpr_result": anpr_event.anpr_result.model_dump()
+                }
+                
+                # Save to database and publish to Redis Pub/Sub
+                event_id = save_and_publish_event(
+                    event_type="anpr",
+                    camera_id=self.camera_id,
+                    timestamp=anpr_event.timestamp,
+                    frame_number=self.frame_count,
+                    snapshot_path=snapshot_path,
+                    event_data=event_data,
+                    camera_name=self.config.camera_name
+                )
+                
+                if event_id:
+                    logger.info(f"Camera {self.camera_id}: Saved and published ANPR event for frame #{self.frame_count}: {anpr_event.anpr_result.license_plate} (confidence: {anpr_event.anpr_result.confidence:.2f}, event_id={event_id}) in {anpr_time:.3f}s")
+                else:
+                    logger.error(f"Camera {self.camera_id}: Failed to save ANPR event")
+            else:
+                logger.debug(f"Camera {self.camera_id}: ANPR event filtered (duplicate plate in cooldown) for frame #{self.frame_count}: {anpr_event.anpr_result.license_plate}")
         
         total_time = time.time() - start_time
         logger.debug(f"Camera {self.camera_id}: Completed processing frame #{self.frame_count} in {total_time:.3f}s")
