@@ -18,12 +18,17 @@ class RedisClient:
     def _connect(self):
         """Establish connection to Redis."""
         try:
-            self._client = redis.Redis(
-                host=settings.redis_host,
-                port=settings.redis_port,
-                db=settings.redis_db,
-                decode_responses=True
-            )
+            connection_kwargs = {
+                "host": settings.redis_host,
+                "port": settings.redis_port,
+                "db": settings.redis_db,
+                "decode_responses": True
+            }
+            # Add password if configured
+            if settings.redis_password:
+                connection_kwargs["password"] = settings.redis_password
+            
+            self._client = redis.Redis(**connection_kwargs)
             self._client.ping()
             logger.info(f"Connected to Redis at {settings.redis_host}:{settings.redis_port}")
         except Exception as e:

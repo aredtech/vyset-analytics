@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     redis_host: str = "redis"
     redis_port: int = 6379
     redis_db: int = 0
+    redis_password: str = ""  # Redis password for authentication
     redis_channel_name: str = "events"  # Pub/Sub channel name
     
     # Database configuration

@@ -12,6 +12,7 @@ from datetime import datetime
 # Configuration
 REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
+REDIS_PASSWORD = None  # Set to your Redis password if authentication is enabled
 REDIS_CHANNEL = 'events'
 MONITOR_DURATION = 30  # seconds
 
@@ -45,7 +46,15 @@ def format_event(event):
 def monitor_events():
     """Monitor and display events from Redis Pub/Sub."""
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        connection_kwargs = {
+            "host": REDIS_HOST,
+            "port": REDIS_PORT,
+            "decode_responses": True
+        }
+        if REDIS_PASSWORD:
+            connection_kwargs["password"] = REDIS_PASSWORD
+        
+        r = redis.Redis(**connection_kwargs)
         r.ping()
         print(f"✅ Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
     except Exception as e:

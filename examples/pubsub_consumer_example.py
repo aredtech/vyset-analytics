@@ -17,7 +17,7 @@ from datetime import datetime
 class EventConsumer:
     """Redis Pub/Sub consumer for real-time events."""
     
-    def __init__(self, host='localhost', port=6379, channel='events'):
+    def __init__(self, host='localhost', port=6379, channel='events', password=None):
         """
         Initialize the consumer.
         
@@ -25,13 +25,18 @@ class EventConsumer:
             host: Redis host
             port: Redis port
             channel: Pub/Sub channel name
+            password: Redis password (optional)
         """
-        self.redis_client = redis.Redis(
-            host=host,
-            port=port,
-            db=0,
-            decode_responses=True
-        )
+        connection_kwargs = {
+            "host": host,
+            "port": port,
+            "db": 0,
+            "decode_responses": True
+        }
+        if password:
+            connection_kwargs["password"] = password
+        
+        self.redis_client = redis.Redis(**connection_kwargs)
         self.channel = channel
         self.pubsub = None
         self.running = False
@@ -156,13 +161,15 @@ if __name__ == "__main__":
     # Configuration
     REDIS_HOST = 'localhost'
     REDIS_PORT = 6379
+    REDIS_PASSWORD = None  # Set to your Redis password if authentication is enabled
     CHANNEL_NAME = 'events'
     
     # Create and start consumer
     consumer = EventConsumer(
         host=REDIS_HOST,
         port=REDIS_PORT,
-        channel=CHANNEL_NAME
+        channel=CHANNEL_NAME,
+        password=REDIS_PASSWORD
     )
     
     try:

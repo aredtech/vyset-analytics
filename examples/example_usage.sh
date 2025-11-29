@@ -53,8 +53,8 @@ echo ""
 echo "5. Monitoring Redis events (press Ctrl+C to stop)..."
 echo "Run this in a separate terminal:"
 echo "python pubsub_consumer_example.py"
-echo "# or use redis-cli:"
-echo "docker exec -it redis redis-cli PSUBSCRIBE '*'"
+echo "# or use redis-cli (with password if configured):"
+echo "docker exec -it redis redis-cli -a \$REDIS_PASSWORD PSUBSCRIBE '*'"
 echo ""
 
 # Wait a bit
