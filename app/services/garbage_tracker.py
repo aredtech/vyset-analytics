@@ -25,6 +25,28 @@ def _patched_torch_load(*args, **kwargs):
 torch.load = _patched_torch_load
 logger.debug("Patched torch.load for garbage tracking YOLO model compatibility")
 
+# Garbage class names that should be treated as garbage
+# These include the original classes and new model classes
+GARBAGE_CLASS_NAMES = [
+    'garbage', 'trash', 'litter', 'waste',
+    'plastic', 'not recyclable', 'food waste'
+]
+
+# Normalized class name to use in events (all garbage classes map to "Garbage")
+GARBAGE_EVENT_CLASS_NAME = "Garbage"
+
+
+def is_garbage_class(class_name: str) -> bool:
+    """Check if a class name should be treated as garbage."""
+    return class_name.lower() in [name.lower() for name in GARBAGE_CLASS_NAMES]
+
+
+def normalize_garbage_class_name(class_name: str) -> str:
+    """Normalize garbage class name to standard "Garbage" for events."""
+    if is_garbage_class(class_name):
+        return GARBAGE_EVENT_CLASS_NAME
+    return class_name
+
 
 class TrackedGarbage:
     """Represents a tracked garbage object across frames."""
@@ -155,10 +177,9 @@ class GarbageTracker:
             detections = detections[detections.confidence >= confidence_threshold]
             
             # Filter for garbage classes only
-            garbage_class_names = ['garbage', 'trash', 'litter', 'waste']
             garbage_class_ids = []
             for class_id, class_name in self.model.names.items():
-                if class_name.lower() in garbage_class_names:
+                if is_garbage_class(class_name):
                     garbage_class_ids.append(class_id)
             
             if garbage_class_ids:
@@ -178,6 +199,9 @@ class GarbageTracker:
                 confidence = float(detections.confidence[i])
                 class_id = int(detections.class_id[i])
                 class_name = self.model.names[class_id]
+                
+                # Normalize class name to "Garbage" for events
+                normalized_class_name = normalize_garbage_class_name(class_name)
                 
                 # Get tracking ID (only available with tracking enabled)
                 track_id = None
@@ -207,7 +231,8 @@ class GarbageTracker:
                 # Check if this is a new track
                 if track_id not in self.active_tracks:
                     # NEW GARBAGE OBJECT ENTERED
-                    tracked_obj = TrackedGarbage(track_id, class_name, frame_number)
+                    # Store normalized class name in tracked object
+                    tracked_obj = TrackedGarbage(track_id, normalized_class_name, frame_number)
                     tracked_obj.update(frame_number, bbox, confidence)
                     self.active_tracks[track_id] = tracked_obj
                     
@@ -217,12 +242,12 @@ class GarbageTracker:
                         version="1.0.0"
                     )
                     
-                    # Generate entry event
+                    # Generate entry event with normalized class name
                     event = TrackingEvent(
                         camera_id=camera_id,
                         track_id=track_id,
                         tracking_action="entered",
-                        class_name=class_name,
+                        class_name=normalized_class_name,
                         frame_number=frame_number,
                         confidence=confidence,
                         bounding_box=bbox,
@@ -230,7 +255,7 @@ class GarbageTracker:
                     )
                     events.append(event)
                     
-                    logger.info(f"Camera {camera_id}: Garbage {class_name} entered (track_id={track_id})")
+                    logger.info(f"Camera {camera_id}: Garbage {class_name} entered (mapped to {normalized_class_name}, track_id={track_id})")
                 else:
                     # Update existing track
                     self.active_tracks[track_id].update(frame_number, bbox, confidence)

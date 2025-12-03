@@ -24,6 +24,28 @@ def _patched_torch_load(*args, **kwargs):
 torch.load = _patched_torch_load
 logger.debug("Patched torch.load for garbage detection YOLO model compatibility")
 
+# Garbage class names that should be treated as garbage
+# These include the original classes and new model classes
+GARBAGE_CLASS_NAMES = [
+    'garbage', 'trash', 'litter', 'waste',
+    'plastic', 'not recyclable', 'food waste'
+]
+
+# Normalized class name to use in events (all garbage classes map to "Garbage")
+GARBAGE_EVENT_CLASS_NAME = "Garbage"
+
+
+def is_garbage_class(class_name: str) -> bool:
+    """Check if a class name should be treated as garbage."""
+    return class_name.lower() in [name.lower() for name in GARBAGE_CLASS_NAMES]
+
+
+def normalize_garbage_class_name(class_name: str) -> str:
+    """Normalize garbage class name to standard "Garbage" for events."""
+    if is_garbage_class(class_name):
+        return GARBAGE_EVENT_CLASS_NAME
+    return class_name
+
 
 class GarbageDetector:
     """
@@ -145,8 +167,11 @@ class GarbageDetector:
                     class_name = self.model.names[class_id]
                     
                     # Only process garbage detections
-                    if class_name.lower() not in ['garbage', 'trash', 'litter', 'waste']:
+                    if not is_garbage_class(class_name):
                         continue
+                    
+                    # Normalize class name to "Garbage" for events
+                    normalized_class_name = normalize_garbage_class_name(class_name)
                     
                     # Get bounding box (xyxy format)
                     box = boxes.xyxy[i].cpu().numpy()
@@ -162,16 +187,16 @@ class GarbageDetector:
                         height=float((y2 - y1) / h)
                     )
                     
-                    # Create detection
+                    # Create detection with normalized class name
                     detection = Detection(
-                        class_name=class_name,
+                        class_name=normalized_class_name,
                         confidence=confidence,
                         bounding_box=bbox,
                         track_id=None  # No tracking for detection-only approach
                     )
                     detections.append(detection)
                     
-                    logger.info(f"Camera {camera_id}: Garbage {class_name} detected (confidence={confidence:.2f})")
+                    logger.info(f"Camera {camera_id}: Garbage {class_name} detected (mapped to {normalized_class_name}, confidence={confidence:.2f})")
             
             # Return DetectionEvent if any garbage was detected
             if detections:
