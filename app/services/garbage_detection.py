@@ -28,7 +28,7 @@ logger.debug("Patched torch.load for garbage detection YOLO model compatibility"
 # These include the original classes and new model classes
 GARBAGE_CLASS_NAMES = [
     'garbage', 'trash', 'litter', 'waste',
-    'plastic', 'not recyclable', 'food waste'
+    'not recyclable', 'food waste'
 ]
 
 # Normalized class name to use in events (all garbage classes map to "Garbage")
