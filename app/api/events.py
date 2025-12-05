@@ -76,6 +76,7 @@ async def list_events(
     event_type: Optional[str] = Query(None, description="Filter by event type (detection, motion, anpr, tracking)"),
     object_class: Optional[str] = Query(None, description="Filter by object class (e.g., person, car, truck, garbage)"),
     license_plate: Optional[str] = Query(None, description="Filter by license plate (supports regex pattern)"),
+    min_confidence: Optional[float] = Query(None, ge=0.0, le=1.0, description="Minimum confidence threshold (0.0-1.0). Works for tracking and ANPR events. For detection events, checks if any detection meets the threshold."),
     start_time: Optional[datetime] = Query(None, description="Start timestamp (ISO format)"),
     end_time: Optional[datetime] = Query(None, description="End timestamp (ISO format)"),
     page: int = Query(1, ge=1, description="Page number"),
@@ -90,6 +91,9 @@ async def list_events(
         event_type: Filter by event type
         object_class: Filter by object class (e.g., person, car, truck, garbage)
         license_plate: Filter by license plate using regex pattern (searches in event_data->anpr_result->license_plate)
+        min_confidence: Minimum confidence threshold (0.0-1.0). For tracking events, filters by event_data->>'confidence'. 
+                       For ANPR events, filters by event_data->'anpr_result'->>'confidence'. 
+                       For detection events, checks if any detection in the detections array has confidence >= threshold.
         start_time: Start timestamp for filtering
         end_time: End timestamp for filtering
         page: Page number (1-indexed)
@@ -124,6 +128,29 @@ async def list_events(
                 text("event_data->'anpr_result'->>'license_plate' IS NOT NULL AND event_data->'anpr_result'->>'license_plate' ~* :license_pattern")
                 .bindparams(license_pattern=license_plate)
             )
+        if min_confidence is not None:
+            # Confidence filtering works differently for different event types:
+            # - Tracking: event_data->>'confidence' >= min_confidence
+            # - ANPR: event_data->'anpr_result'->>'confidence' >= min_confidence
+            # - Detection: Check if any detection in event_data->'detections' array has confidence >= min_confidence
+            # - Motion: No confidence field, so exclude motion events when confidence filter is applied
+            logger.info(f"Adding min_confidence filter: {min_confidence}")
+            confidence_filter = text("""
+                (
+                    -- For tracking events: check direct confidence field
+                    (event_type = 'tracking' AND (event_data->>'confidence')::float >= :min_conf)
+                    OR
+                    -- For ANPR events: check nested confidence in anpr_result
+                    (event_type = 'anpr' AND (event_data->'anpr_result'->>'confidence')::float >= :min_conf)
+                    OR
+                    -- For detection events: check if any detection has confidence >= threshold
+                    (event_type = 'detection' AND EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(event_data->'detections') AS det
+                        WHERE (det->>'confidence')::float >= :min_conf
+                    ))
+                )
+            """).bindparams(min_conf=min_confidence)
+            filters.append(confidence_filter)
         if start_time:
             filters.append(EventRecord.timestamp >= start_time)
         if end_time:
