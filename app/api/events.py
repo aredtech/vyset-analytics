@@ -104,6 +104,9 @@ async def list_events(
         Paginated list of events
     """
     try:
+        # Debug log to verify code version
+        logger.info("DEBUG: Executing list_events with JSONB cast fix")
+        
         # Build query
         query = db.query(EventRecord)
         
@@ -145,7 +148,7 @@ async def list_events(
                     OR
                     -- For detection events: check if any detection has confidence >= threshold
                     (event_type = 'detection' AND EXISTS (
-                        SELECT 1 FROM jsonb_array_elements(event_data->'detections') AS det
+                        SELECT 1 FROM jsonb_array_elements((event_data->'detections')::jsonb) AS det
                         WHERE (det->>'confidence')::float >= :min_conf
                     ))
                 )
