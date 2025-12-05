@@ -53,7 +53,12 @@ class SnapshotManager:
         date_dir.mkdir(exist_ok=True)
         
         # Generate filename: eventtype_HHMMSS_microseconds.png
-        filename = f"{event_type}_{timestamp.strftime('%H%M%S')}_{timestamp.microsecond:06d}.png"
+        # Generate filename: eventtype_HHMMSS_microseconds.ext
+        ext = settings.snapshot_format.lower().replace("jpeg", "jpg")
+        if not ext:
+            ext = "jpg"
+            
+        filename = f"{event_type}_{timestamp.strftime('%H%M%S')}_{timestamp.microsecond:06d}.{ext}"
         full_path = date_dir / filename
         
         # Return relative path from snapshots_dir
@@ -150,7 +155,18 @@ class SnapshotManager:
             # Generate path and save
             relative_path = self._get_snapshot_path(camera_id, "detection", timestamp)
             full_path = self.snapshots_dir / relative_path
-            cv2.imwrite(str(full_path), annotated_frame)
+            
+            # Set compression parameters
+            encode_params = []
+            if settings.snapshot_format.lower() in ["jpg", "jpeg"]:
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), settings.snapshot_quality]
+            elif settings.snapshot_format.lower() == "png":
+                # For PNG, quality is compression level (0-9). We'll map the 0-100 scale roughly to 0-9
+                compression = int((100 - settings.snapshot_quality) / 10)
+                compression = max(0, min(9, compression))
+                encode_params = [int(cv2.IMWRITE_PNG_COMPRESSION), compression]
+
+            cv2.imwrite(str(full_path), annotated_frame, encode_params)
             
             logger.debug(f"Saved detection snapshot: {relative_path}")
             return relative_path
@@ -208,7 +224,18 @@ class SnapshotManager:
             # Generate path and save
             relative_path = self._get_snapshot_path(camera_id, "motion", timestamp)
             full_path = self.snapshots_dir / relative_path
-            cv2.imwrite(str(full_path), annotated_frame)
+            
+            # Set compression parameters
+            encode_params = []
+            if settings.snapshot_format.lower() in ["jpg", "jpeg"]:
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), settings.snapshot_quality]
+            elif settings.snapshot_format.lower() == "png":
+                # For PNG, quality is compression level (0-9). We'll map the 0-100 scale roughly to 0-9
+                compression = int((100 - settings.snapshot_quality) / 10)
+                compression = max(0, min(9, compression))
+                encode_params = [int(cv2.IMWRITE_PNG_COMPRESSION), compression]
+
+            cv2.imwrite(str(full_path), annotated_frame, encode_params)
             
             logger.debug(f"Saved motion snapshot: {relative_path}")
             return relative_path
@@ -268,7 +295,18 @@ class SnapshotManager:
             # Generate path and save
             relative_path = self._get_snapshot_path(camera_id, "anpr", timestamp)
             full_path = self.snapshots_dir / relative_path
-            cv2.imwrite(str(full_path), annotated_frame)
+            
+            # Set compression parameters
+            encode_params = []
+            if settings.snapshot_format.lower() in ["jpg", "jpeg"]:
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), settings.snapshot_quality]
+            elif settings.snapshot_format.lower() == "png":
+                # For PNG, quality is compression level (0-9). We'll map the 0-100 scale roughly to 0-9
+                compression = int((100 - settings.snapshot_quality) / 10)
+                compression = max(0, min(9, compression))
+                encode_params = [int(cv2.IMWRITE_PNG_COMPRESSION), compression]
+
+            cv2.imwrite(str(full_path), annotated_frame, encode_params)
             
             logger.debug(f"Saved ANPR snapshot: {relative_path}")
             return relative_path

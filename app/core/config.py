@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # Snapshot configuration
     snapshots_dir: str = "/app/snapshots"
     enable_snapshots: bool = True
+    snapshot_format: str = "jpg"
+    snapshot_quality: int = 80
     
     # Logging
     log_level: str = "INFO"
