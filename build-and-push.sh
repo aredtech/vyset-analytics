@@ -26,20 +26,28 @@ fi
 #     exit 1
 # fi
 
-# Build the Docker image for AMD64 platform
-echo "🔨 Building Docker image for AMD64 platform..."
-docker build --platform linux/amd64 -t "${FULL_IMAGE_NAME}" .
+# Ensure buildx is available and create builder if needed (for multi-platform)
+echo "🔧 Setting up Docker Buildx for multi-platform build..."
+if ! docker buildx version &> /dev/null; then
+    echo "❌ Error: docker buildx is required for multi-platform builds. Please upgrade Docker."
+    exit 1
+fi
+docker buildx create --name multiarch-builder --use 2>/dev/null || docker buildx use multiarch-builder 2>/dev/null || true
+
+# Build and push for both AMD64 and ARM64 (single manifest, multi-platform image)
+echo "🔨 Building Docker image for linux/amd64 and linux/arm64..."
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --tag "${FULL_IMAGE_NAME}" \
+    --push \
+    .
 
 if [ $? -eq 0 ]; then
-    echo "✅ Build successful!"
+    echo "✅ Multi-platform build successful!"
 else
     echo "❌ Build failed!"
     exit 1
 fi
-
-# Push the image to DockerHub
-echo "📤 Pushing image to DockerHub..."
-docker push "${FULL_IMAGE_NAME}"
 
 if [ $? -eq 0 ]; then
     echo "✅ Push successful!"
@@ -49,11 +57,10 @@ else
     exit 1
 fi
 
-# Optional: Also tag and push as 'latest' if version is not 'latest'
+# Optional: Also tag as 'latest' on registry if version is not 'latest'
 if [ "${VERSION}" != "latest" ]; then
-    echo "🏷️  Also tagging as latest..."
-    docker tag "${FULL_IMAGE_NAME}" "${DOCKER_NAMESPACE}/${IMAGE_NAME}:latest"
-    docker push "${DOCKER_NAMESPACE}/${IMAGE_NAME}:latest"
+    echo "🏷️  Tagging as latest on registry..."
+    docker buildx imagetools create -t "${DOCKER_NAMESPACE}/${IMAGE_NAME}:latest" "${FULL_IMAGE_NAME}"
     echo "✅ Latest tag pushed!"
 fi
 

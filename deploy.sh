@@ -2,6 +2,7 @@
 
 # Deploy Script for VMS Analytics Service
 # This script pulls the latest image from DockerHub and deploys it on the server
+# Supports both AMD64 (x86_64) and ARM64 (aarch64) - pulls the correct image for the current CPU
 
 set -e  # Exit on any error
 
@@ -13,8 +14,17 @@ FULL_IMAGE_NAME="${DOCKER_NAMESPACE}/${IMAGE_NAME}:${VERSION}"
 CONTAINER_NAME="analytics-service"
 COMPOSE_FILE="docker-compose.yml"
 
+# Detect CPU architecture for multi-platform image pull (AMD64 / ARM64)
+ARCH=$(uname -m)
+case "${ARCH}" in
+    x86_64|amd64)  PLATFORM="linux/amd64" ;;
+    aarch64|arm64) PLATFORM="linux/arm64" ;;
+    *)             PLATFORM="linux/amd64"; echo "⚠️  Unknown arch ${ARCH}, defaulting to linux/amd64" ;;
+esac
+
 echo "🚀 Deploying VMS Analytics Service..."
 echo "📦 Image: ${FULL_IMAGE_NAME}"
+echo "🖥️  Platform: ${PLATFORM} (${ARCH})"
 
 # Check if Docker is running
 if ! docker info > /dev/null 2>&1; then
@@ -40,9 +50,9 @@ if [ ! -f "${COMPOSE_FILE}" ]; then
     exit 1
 fi
 
-# Pull the latest image
-echo "📥 Pulling latest image from DockerHub..."
-docker pull "${FULL_IMAGE_NAME}"
+# Pull the latest image for current platform (AMD64 or ARM64)
+echo "📥 Pulling image for ${PLATFORM} from DockerHub..."
+docker pull --platform "${PLATFORM}" "${FULL_IMAGE_NAME}"
 
 if [ $? -eq 0 ]; then
     echo "✅ Image pulled successfully!"
