@@ -9,8 +9,6 @@ __pycache__
 venv/
 env/
 ENV/
-*.pt
-*.onnx
 runs/
 .DS_Store
 README.md
