@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     docker_namespace: str = "dockared"
     version: str = "latest"
     
+    # Location/GPS fetch
+    location_fetch_base_url: str = ""
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

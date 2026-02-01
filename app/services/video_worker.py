@@ -1,7 +1,11 @@
 import cv2
 import threading
+import multiprocessing
+import queue
 import time
 import os
+import copy
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 import urllib.request
@@ -13,7 +17,7 @@ from app.services.motion import MotionDetector
 from app.services.anpr import ANPRDetector
 from app.services.garbage_detection import GarbageDetector
 from app.services.event_filter import EventFilter
-from app.core.redis_client import redis_client
+from app.core.redis_client import redis_client, RedisClient
 from app.core.database import get_db_context
 from app.utils.snapshot import snapshot_manager
 from app.utils.logger import get_logger
@@ -28,7 +32,89 @@ os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
 VEHICLE_CLASSES = {'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'van', 'suv'}
 
 
-def save_and_publish_event(
+@dataclass
+class EventTask:
+    """Data class for event processing tasks."""
+    event_type: str
+    camera_id: str
+    timestamp: str
+    frame_number: int
+    snapshot_path: Optional[str]
+    event_data: dict
+    camera_name: Optional[str] = None
+    geofence_context: Optional[dict] = None
+
+
+class BackgroundEventProcessor(threading.Thread):
+    """Background worker for processing events asynchronously."""
+    
+    def __init__(self, queue_size: int = 1000):
+        super().__init__(daemon=True)
+        self.queue = queue.Queue(maxsize=queue_size)
+        self.running = True
+        self.name = "BackgroundEventProcessor"
+        logger.info(f"Initialized BackgroundEventProcessor with queue size {queue_size}")
+        
+    def add_event(self, task: EventTask) -> bool:
+        """Add event to processing queue."""
+        try:
+            self.queue.put(task, block=False)
+            return True
+        except queue.Full:
+            logger.warning(f"Event queue full! Dropping event {task.event_type} for camera {task.camera_id}")
+            return False
+            
+    def run(self):
+        """Main processing loop."""
+        print(f"DEBUG: BackgroundEventProcessor thread started in PID {os.getpid()}")
+        logger.info("BackgroundEventProcessor started")
+        while self.running:
+            try:
+                # Get task with timeout to allow checking self.running
+                try:
+                    task = self.queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                # Process the task
+                self._process_task(task)
+                
+                # Mark task as done
+                self.queue.task_done()
+                
+            except Exception as e:
+                logger.error(f"Error in BackgroundEventProcessor loop: {e}", exc_info=True)
+                
+        logger.info("BackgroundEventProcessor stopped")
+        
+    def stop(self):
+        """Stop the processor."""
+        self.running = False
+        
+    def _process_task(self, task: EventTask):
+        """Process a single event task."""
+        try:
+            # We use the internal sync function to do the actual work
+            _save_and_publish_event_sync(
+                event_type=task.event_type,
+                camera_id=task.camera_id,
+                timestamp=task.timestamp,
+                frame_number=task.frame_number,
+                snapshot_path=task.snapshot_path,
+                event_data=task.event_data,
+                camera_name=task.camera_name,
+                geofence_context=task.geofence_context
+            )
+        except Exception as e:
+            logger.error(f"Failed to process event task: {e}", exc_info=True)
+
+
+# Global event processor instance
+event_processor = BackgroundEventProcessor()
+event_processor.start()
+
+
+def _save_and_publish_event_sync(
     event_type: str,
     camera_id: str,
     timestamp: str,
@@ -39,21 +125,8 @@ def save_and_publish_event(
     geofence_context: Optional[dict] = None
 ) -> Optional[int]:
     """
-    Save event to database and publish to Redis Pub/Sub.
-    This ensures all events are persisted and available for real-time consumption.
-    
-    Args:
-        event_type: Type of event (detection, motion, anpr, tracking)
-        camera_id: Camera identifier
-        timestamp: Event timestamp in ISO format
-        frame_number: Frame number
-        snapshot_path: Path to snapshot image (if available)
-        event_data: Event-specific data as dictionary
-        camera_name: Human-readable camera name (optional)
-        geofence_context: Geofence signal context (signal_type, lat, long, metadata) (optional)
-        
-    Returns:
-        Event ID from database if successful, None otherwise
+    Internal synchronous implementation of saving event to database and publishing to Redis.
+    This contains the original logic of save_and_publish_event.
     """
     try:
         # Fetch latest GPS data only when location fetch base URL is configured
@@ -143,7 +216,7 @@ def save_and_publish_event(
             db.refresh(event_record)
             
             event_id = event_record.id
-            logger.debug(f"Saved {event_type} event to database (ID: {event_id})")
+            logger.info(f"BackgroundWorker: Saved {event_type} event to database (ID: {event_id})")
             
             # Publish to Redis Pub/Sub
             try:
@@ -159,7 +232,7 @@ def save_and_publish_event(
                     "created_at": event_record.created_at.isoformat()
                 }
                 num_subscribers = redis_client.publish_event(redis_event_data)
-                logger.debug(f"Published {event_type} event to Redis Pub/Sub (subscribers: {num_subscribers})")
+                logger.info(f"BackgroundWorker: Published {event_type} event to Redis Pub/Sub (subscribers: {num_subscribers})")
             except Exception as redis_e:
                 logger.error(f"Failed to publish {event_type} event to Redis: {redis_e}", exc_info=True)
             
@@ -167,6 +240,65 @@ def save_and_publish_event(
             
     except Exception as e:
         logger.error(f"Failed to save and publish {event_type} event: {e}", exc_info=True)
+        return None
+
+
+def save_and_publish_event(
+    event_type: str,
+    camera_id: str,
+    timestamp: str,
+    frame_number: int,
+    snapshot_path: Optional[str],
+    event_data: dict,
+    camera_name: Optional[str] = None,
+    geofence_context: Optional[dict] = None
+) -> Optional[int]:
+    """
+    Queue event for background processing.
+    
+    Returns:
+        None (as processing is async), or 0 to indicate valid queuing if callers check for truthiness.
+        However, original returned event_id. We can't return that anymore.
+    """
+    try:
+        # Create a deep copy of event_data and geofence_context to prevent mutation issues
+        # since these might be modified by the caller or the worker asynchronously
+        event_data_copy = copy.deepcopy(event_data)
+        geofence_context_copy = copy.deepcopy(geofence_context) if geofence_context else None
+        
+        task = EventTask(
+            event_type=event_type,
+            camera_id=camera_id,
+            timestamp=timestamp,
+            frame_number=frame_number,
+            snapshot_path=snapshot_path,
+            event_data=event_data_copy,
+            camera_name=camera_name,
+            geofence_context=geofence_context_copy
+        )
+        
+        if event_processor.add_event(task):
+            # Debug: check if thread is actually running
+            if not event_processor.is_alive():
+                msg = f"CRITICAL: Event processor thread is DEAD in PID {os.getpid()}! Events will not be processed."
+                print(msg)
+                logger.error(msg)
+                # Try to restart it?
+                try:
+                    logger.warning("Attempting to restart event processor...")
+                    event_processor.start()
+                except Exception as e:
+                    logger.error(f"Failed to restart event processor: {e}")
+
+            logger.debug(f"Queued {event_type} event for camera {camera_id}")
+            # Return a dummy ID so callers like 'if event_id:' still work
+            # This is a bit of a lie, but sufficient for logging flow control
+            return -1 
+        else:
+            return None
+            
+    except Exception as e:
+        logger.error(f"Failed to queue {event_type} event: {e}", exc_info=True)
         return None
 
 
@@ -191,30 +323,35 @@ class CameraWorker:
             logger.info(f"Camera {config.camera_id}: Replaced localhost with mediamtx in stream URL. Old: {old_url}, New: {self.config.stream_url}")
             
         self.camera_id = config.camera_id
-        self.running = False
-        self.thread = None
+        # Use multiprocessing Event for stopping
+        self.stop_event = multiprocessing.Event()
+        self.process = None  # Renamed from thread
         self.cap = None
         self.frame_count = 0
         self.mandatory_event_saved = False
         self.analytics_event_detected = False
         self.start_time = 0
         
-        # Initialize event filter (only for motion and ANPR now)
+        # Initialize event filter
         self.event_filter = EventFilter(
             camera_id=config.camera_id,
-            detection_cooldown=0.0,  # Not used anymore
+            detection_cooldown=0.0,
             motion_cooldown=config.parameters.motion_cooldown_seconds,
             anpr_cooldown=config.parameters.anpr_cooldown_seconds,
-            change_threshold=0.0  # Not used anymore
+            change_threshold=0.0
         )
         
-        # Initialize detectors
+        # Detectors will be initialized in the process (lazy init)
         self.object_detector = None
         self.motion_detector = None
         self.anpr_detector = None
         self.garbage_detector = None
         
-        logger.debug(f"Camera {self.camera_id}: Initializing detectors (object_detection={config.parameters.enable_object_detection}, motion_detection={config.parameters.enable_motion_detection}, garbage_detection={config.parameters.enable_garbage_detection}, anpr={config.parameters.enable_anpr})")
+    def _init_detectors(self):
+        """Initialize detectors inside the process."""
+        config = self.config
+        
+        logger.debug(f"Camera {self.camera_id}: Initializing detectors in process {os.getpid()} (object_detection={config.parameters.enable_object_detection}, motion_detection={config.parameters.enable_motion_detection}, garbage_detection={config.parameters.enable_garbage_detection}, anpr={config.parameters.enable_anpr})")
         
         if config.parameters.enable_object_detection:
             logger.debug(f"Camera {self.camera_id}: Creating ObjectDetector with tracking")
@@ -255,37 +392,43 @@ class CameraWorker:
         logger.info(f"Camera {self.camera_id}: CameraWorker initialized successfully (stream_url={config.stream_url})")
     
     def start(self):
-        """Start the camera processing thread."""
+        """Start the camera processing process."""
         logger.debug(f"Camera {self.camera_id}: start() called")
         
-        if self.running:
+        if self.process and self.process.is_alive():
             logger.warning(f"Camera {self.camera_id} is already running")
             return
+            
+        # Reset stop event
+        self.stop_event.clear()
         
-        logger.debug(f"Camera {self.camera_id}: Creating processing thread")
-        self.running = True
-        self.thread = threading.Thread(target=self._process_stream, daemon=True)
-        self.thread.start()
-        logger.info(f"Camera {self.camera_id}: Started camera worker thread (thread_id={self.thread.ident})")
+        logger.debug(f"Camera {self.camera_id}: Creating processing process")
+        # Use multiprocessing.Process instead of threading.Thread
+        self.process = multiprocessing.Process(target=self._process_stream, daemon=True)
+        self.process.start()
+        logger.info(f"Camera {self.camera_id}: Started camera worker process (pid={self.process.pid})")
     
     def stop(self):
-        """Stop the camera processing thread."""
+        """Stop the camera processing process."""
         logger.debug(f"Camera {self.camera_id}: stop() called")
         
-        if not self.running:
-            logger.debug(f"Camera {self.camera_id}: Already stopped")
+        if not self.process:
+            logger.debug(f"Camera {self.camera_id}: Already stopped (no process)")
             return
         
         logger.info(f"Camera {self.camera_id}: Stopping camera worker...")
-        self.running = False
+        self.stop_event.set()
         
-        if self.thread:
-            logger.debug(f"Camera {self.camera_id}: Waiting for thread to join (timeout=5s)")
-            self.thread.join(timeout=5)
-            if self.thread.is_alive():
-                logger.warning(f"Camera {self.camera_id}: Thread did not stop within timeout")
+        if self.process:
+            logger.debug(f"Camera {self.camera_id}: Waiting for process to join (timeout=5s)")
+            self.process.join(timeout=5)
+            if self.process.is_alive():
+                logger.warning(f"Camera {self.camera_id}: Process did not stop within timeout, terminating...")
+                self.process.terminate()
             else:
-                logger.debug(f"Camera {self.camera_id}: Thread stopped successfully")
+                logger.debug(f"Camera {self.camera_id}: Process stopped successfully")
+            
+            self.process = None
         
         if self.cap:
             logger.debug(f"Camera {self.camera_id}: Releasing video capture")
@@ -364,25 +507,51 @@ class CameraWorker:
             logger.error(f"Error connecting to stream for camera {self.camera_id}: {e}", exc_info=True)
             return False
     
+    
     def _process_stream(self):
         """Main processing loop for camera stream."""
+        # Re-initialize global singletons for this separate process
+        # This is CRITICAL because:
+        # 1. Threads (BackgroundEventProcessor) are NOT copied to child processes on fork/spawn
+        # 2. Redis sockets should NOT be shared across processes
+        global event_processor, redis_client
+        
+        print(f"DEBUG: _process_stream running in PID {os.getpid()}")
+        logger.info(f"Camera {self.camera_id}: Re-initializing global state in child process {os.getpid()}")
+        
+        # 1. Re-init Redis Client
+        # The old global object exists but points to a socket in the parent process.
+        # We overwrite the global variable in THIS process only.
+        redis_client = RedisClient()
+        logger.info(f"Camera {self.camera_id}: RedisClient re-initialized")
+        
+        # 2. Re-init Event Processor
+        # The old global object exists but its thread is DEAD (if fork) or missing.
+        # We create a new one for this process.
+        event_processor = BackgroundEventProcessor()
+        event_processor.start()
+        logger.info(f"Camera {self.camera_id}: BackgroundEventProcessor re-initialized and started")
+        
+        # Initialize detectors in the new process
+        self._init_detectors()
+        
         # Retry connection every 10 seconds until successful
         logger.info(f"Camera {self.camera_id}: Attempting initial connection...")
-        while self.running:
+        while not self.stop_event.is_set():
             if self._connect_to_stream():
                 logger.info(f"Camera {self.camera_id}: Initial connection successful")
                 break
             else:
                 logger.warning(f"Camera {self.camera_id}: Initial connection failed, retrying in 10 seconds...")
-                # Wait 10 seconds before retrying, but check self.running periodically
+                # Wait 10 seconds before retrying, but check stop_event periodically
                 for _ in range(10):
-                    if not self.running:
+                    if self.stop_event.is_set():
                         logger.info(f"Camera {self.camera_id}: Worker stopped during connection retry")
                         return
                     time.sleep(1)
         
-        # If we exited the connection loop because running is False, cleanup and return
-        if not self.running:
+        # If we exited the connection loop because stop_event is set, cleanup and return
+        if self.stop_event.is_set():
             logger.info(f"Camera {self.camera_id}: Worker stopped before connection established")
             return
         
@@ -393,7 +562,7 @@ class CameraWorker:
         self.start_time = time.time()
         logger.info(f"Camera {self.camera_id}: Starting frame processing loop (max_fps={self.config.parameters.max_fps}, frame_skip={self.config.parameters.frame_skip})")
         
-        while self.running:
+        while not self.stop_event.is_set():
             try:
                 # Check if stream is still open
                 if self.cap is None or not self.cap.isOpened():
@@ -401,21 +570,21 @@ class CameraWorker:
                     if self.cap:
                         self.cap.release()
                     # Retry connection every 10 seconds
-                    while self.running:
+                    while not self.stop_event.is_set():
                         if self._connect_to_stream():
                             logger.info(f"Camera {self.camera_id}: Reconnected successfully")
                             break
                         else:
                             logger.warning(f"Camera {self.camera_id}: Reconnection failed, retrying in 10 seconds...")
-                            # Wait 10 seconds before retrying, but check self.running periodically
+                            # Wait 10 seconds before retrying, but check stop_event periodically
                             for _ in range(10):
-                                if not self.running:
+                                if self.stop_event.is_set():
                                     logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection retry")
                                     return
                                 time.sleep(1)
                     
-                    # If we exited the reconnection loop because running is False, cleanup and return
-                    if not self.running:
+                    # If we exited the reconnection loop because stop_event is set, cleanup and return
+                    if self.stop_event.is_set():
                         logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection")
                         if self.cap:
                             self.cap.release()
@@ -442,21 +611,21 @@ class CameraWorker:
                     if self.cap:
                         self.cap.release()
                     # Retry connection every 10 seconds
-                    while self.running:
+                    while not self.stop_event.is_set():
                         if self._connect_to_stream():
                             logger.info(f"Camera {self.camera_id}: Reconnected after frame read failure")
                             break
                         else:
                             logger.warning(f"Camera {self.camera_id}: Reconnection failed, retrying in 10 seconds...")
-                            # Wait 10 seconds before retrying, but check self.running periodically
+                            # Wait 10 seconds before retrying, but check stop_event periodically
                             for _ in range(10):
-                                if not self.running:
+                                if self.stop_event.is_set():
                                     logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection retry")
                                     return
                                 time.sleep(1)
                     
-                    # If we exited the reconnection loop because running is False, cleanup and return
-                    if not self.running:
+                    # If we exited the reconnection loop because stop_event is set, cleanup and return
+                    if self.stop_event.is_set():
                         logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection")
                         if self.cap:
                             self.cap.release()
@@ -495,21 +664,21 @@ class CameraWorker:
                         pass
                 
                 # Retry connection every 10 seconds
-                while self.running:
+                while not self.stop_event.is_set():
                     if self._connect_to_stream():
                         logger.info(f"Camera {self.camera_id}: Reconnected after exception")
                         break
                     else:
                         logger.warning(f"Camera {self.camera_id}: Reconnection failed after exception, retrying in 10 seconds...")
-                        # Wait 10 seconds before retrying, but check self.running periodically
+                        # Wait 10 seconds before retrying, but check stop_event periodically
                         for _ in range(10):
-                            if not self.running:
+                            if self.stop_event.is_set():
                                 logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection retry after exception")
                                 return
                             time.sleep(1)
                 
-                # If we exited the reconnection loop because running is False, cleanup and return
-                if not self.running:
+                # If we exited the reconnection loop because stop_event is set, cleanup and return
+                if self.stop_event.is_set():
                     logger.info(f"Camera {self.camera_id}: Worker stopped during reconnection after exception")
                     if self.cap:
                         try:
@@ -529,6 +698,12 @@ class CameraWorker:
                 self.cap.release()
             except:
                 pass
+        
+        # Stop local event processor
+        if 'event_processor' in globals() and event_processor:
+            logger.info(f"Camera {self.camera_id}: Stopping local event processor")
+            event_processor.stop()
+            event_processor.join(timeout=2)
     
     def _process_frame(self, frame):
         """

@@ -33,15 +33,27 @@ async def lifespan(app: FastAPI):
     else:
         logger.error("Failed to connect to Redis")
     
-    # Initialize database
-    try:
-        if check_db_connection():
-            logger.info("Database connection verified")
-            init_db()
-        else:
-            logger.error("Failed to connect to database")
-    except Exception as e:
-        logger.error(f"Database initialization error: {e}", exc_info=True)
+    # Initialize database with retry logic
+    max_retries = 5
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            if check_db_connection():
+                logger.info("Database connection verified")
+                init_db()
+                break
+            else:
+                logger.warning(f"Database connection check failed (Attempt {attempt+1}/{max_retries})")
+        except Exception as e:
+            logger.error(f"Database initialization error (Attempt {attempt+1}/{max_retries}): {e}")
+        
+        if attempt < max_retries - 1:
+            import asyncio
+            logger.info(f"Retrying database connection in {retry_delay}s...")
+            await asyncio.sleep(retry_delay)
+    else:
+        logger.error("Failed to establish database connection after multiple attempts")
     
     # Start retention scheduler
     try:

@@ -101,8 +101,8 @@ def initialize_database_connection():
     logger.info("Database connection initialized")
 
 
-# Initialize database connection on module import
-initialize_database_connection()
+# Initialize database connection on module import - REDUNDANT / DANGEROUS
+# initialize_database_connection()
 
 
 def get_db() -> Generator[Session, None, None]:
