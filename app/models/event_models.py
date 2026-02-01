@@ -64,6 +64,7 @@ class CameraConfig(BaseModel):
     status: CameraStatus = CameraStatus.ACTIVE
     stream_url: str
     parameters: CameraParameters = Field(default_factory=CameraParameters)
+    geofence_context: Optional[Dict[str, Any]] = Field(default=None, description="Geofence signal context (signal_type, lat, long, metadata)")
 
 
 class BoundingBox(BaseModel):

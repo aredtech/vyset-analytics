@@ -2,8 +2,10 @@ import cv2
 import threading
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
+import urllib.request
+import json
 from app.models.event_models import CameraConfig, CameraStatus, Detection
 from app.models.db_models import EventRecord
 from app.services.detection import ObjectDetector
@@ -33,7 +35,8 @@ def save_and_publish_event(
     frame_number: int,
     snapshot_path: Optional[str],
     event_data: dict,
-    camera_name: Optional[str] = None
+    camera_name: Optional[str] = None,
+    geofence_context: Optional[dict] = None
 ) -> Optional[int]:
     """
     Save event to database and publish to Redis Pub/Sub.
@@ -47,11 +50,80 @@ def save_and_publish_event(
         snapshot_path: Path to snapshot image (if available)
         event_data: Event-specific data as dictionary
         camera_name: Human-readable camera name (optional)
+        geofence_context: Geofence signal context (signal_type, lat, long, metadata) (optional)
         
     Returns:
         Event ID from database if successful, None otherwise
     """
     try:
+        # Fetch latest GPS data only when location fetch base URL is configured
+        location_base_url = os.environ.get("LOCATION_FETCH_BASE_URL", "").strip()
+        if location_base_url:
+            try:
+                url = f"{location_base_url.rstrip('/')}/api/v1/ExtTrans/GetGpsDataByCamera"
+                headers = {
+                    'tenant': '624011100',
+                    'Content-Type': 'application/json'
+                }
+                # Format timestamp to IST (UTC+5:30)
+                timestamp_payload = timestamp
+                try:
+                    # Parse timestamp (handling Z for UTC)
+                    if isinstance(timestamp, str):
+                        ts_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        
+                        # Define IST timezone
+                        ist_tz = timezone(timedelta(hours=5, minutes=30))
+                        
+                        # Convert to IST
+                        ts_ist = ts_dt.astimezone(ist_tz)
+                        timestamp_payload = ts_ist.isoformat()
+                except Exception as e:
+                    logger.warning(f"Failed to format timestamp for GPS API: {e}")
+                    
+                payload = {
+                    "CameraId": camera_id,  # "cameraid is our camera id"
+                    "TimeStamp": timestamp_payload  # Using event timestamp in IST
+                }
+                
+                data = json.dumps(payload).encode('utf-8')
+                req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+                
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if response.status == 200:
+                        response_body = response.read().decode('utf-8')
+                        gps_data = json.loads(response_body)
+                        if "Latitude" in gps_data and "Longitude" in gps_data:
+                            # Found GPS data - update existing geofence context or create new one
+                            if geofence_context is None:
+                                geofence_context = {
+                                    "signal_id": None
+                                }
+                            
+                            geofence_context["latitude"] = gps_data["Latitude"]
+                            geofence_context["longitude"] = gps_data["Longitude"]
+                            
+                            # Ensure signal_id is set if we have geofence_signal_id from backend
+                            if "geofence_signal_id" in geofence_context and "signal_id" not in geofence_context:
+                                geofence_context["signal_id"] = geofence_context["geofence_signal_id"]
+                                
+                            logger.debug(f"Updated geofence context with GPS data for camera {camera_id}: Lat={gps_data['Latitude']}, Lon={gps_data['Longitude']}")
+                    else:
+                        logger.warning(f"Failed to fetch GPS data: Status {response.status}")
+            except Exception as e:
+                # If GPS fetch fails, we just keep the original geofence_context
+                logger.error(f"Error fetching GPS data: {e}")
+
+        if geofence_context:
+            event_data["geofence_context"] = geofence_context
+            # Add analytics_event_found metadata
+            # If this is a mandatory capture (geofence_capture), analytics_event_found is False
+            # Otherwise (real detection), it is True
+            if event_type == "geofence_capture":
+                event_data["geofence_context"]["analytics_event_found"] = False
+            else:
+                event_data["geofence_context"]["analytics_event_found"] = True
+        
         # Save to database
         with get_db_context() as db:
             # Convert ISO timestamp to datetime
@@ -123,6 +195,9 @@ class CameraWorker:
         self.thread = None
         self.cap = None
         self.frame_count = 0
+        self.mandatory_event_saved = False
+        self.analytics_event_detected = False
+        self.start_time = 0
         
         # Initialize event filter (only for motion and ANPR now)
         self.event_filter = EventFilter(
@@ -315,6 +390,7 @@ class CameraWorker:
         last_frame_time = time.time()
         target_frame_interval = 1.0 / self.config.parameters.max_fps
         
+        self.start_time = time.time()
         logger.info(f"Camera {self.camera_id}: Starting frame processing loop (max_fps={self.config.parameters.max_fps}, frame_skip={self.config.parameters.frame_skip})")
         
         while self.running:
@@ -464,6 +540,52 @@ class CameraWorker:
         logger.debug(f"Camera {self.camera_id}: Processing frame #{self.frame_count} (shape: {frame.shape})")
         start_time = time.time()
         
+        # Mark analytics detected if not already
+        if not self.analytics_event_detected:
+            # Check if any detectors found something in this frame later in the code
+            # We will update this flag when we find something
+            pass
+
+        # Check for mandatory one-time signal capture check (timeout based)
+        if not self.mandatory_event_saved and not self.analytics_event_detected and self.config.geofence_context:
+            signal = self.config.geofence_context.get("signal")
+            if signal == "one_time_signal":
+                try:
+                    # Check timeout (e.g., 12 seconds to be safe before 30s backend cutoff)
+                    elapsed = time.time() - self.start_time
+                    if elapsed > 12:
+                        logger.info(f"Camera {self.camera_id}: No analytics event found after 12s. Capturing mandatory event.")
+                        
+                        # Save generic snapshot
+                        snapshot_path = snapshot_manager.save_detection_snapshot(
+                            frame=frame,
+                            camera_id=self.camera_id,
+                            detections=[],
+                            timestamp=datetime.utcnow()
+                        )
+                        
+                        event_data = {
+                            "type": "mandatory_capture",
+                            "signal": "one_time_signal",
+                            "geofence_context": self.config.geofence_context
+                        }
+                        
+                        save_and_publish_event(
+                            event_type="geofence_capture",
+                            camera_id=self.camera_id,
+                            timestamp=(datetime.utcnow().isoformat() + "Z"),
+                            frame_number=self.frame_count,
+                            snapshot_path=snapshot_path,
+                            event_data=event_data,
+                            camera_name=self.config.camera_name,
+                            geofence_context=self.config.geofence_context
+                        )
+                        
+                        self.mandatory_event_saved = True
+                        logger.info(f"Camera {self.camera_id}: Mandatory one-time signal event saved")
+                except Exception as e:
+                    logger.error(f"Camera {self.camera_id}: Failed to save mandatory event: {e}", exc_info=True)
+        
         # Track if any vehicles are detected in this frame (for ANPR)
         vehicles_detected = False
         tracking_events = []
@@ -539,10 +661,13 @@ class CameraWorker:
                         frame_number=self.frame_count,
                         snapshot_path=snapshot_path,
                         event_data=event_data,
-                        camera_name=self.config.camera_name
+                        camera_name=self.config.camera_name,
+                        geofence_context=self.config.geofence_context
                     )
                     
+                    
                     if event_id:
+                        self.analytics_event_detected = True
                         logger.info(f"Camera {self.camera_id}: Saved and published tracking event '{event.tracking_action}' for {event.class_name} (track_id={event.track_id}, event_id={event_id}) in {detect_time:.3f}s")
                     else:
                         logger.error(f"Camera {self.camera_id}: Failed to save tracking event for track_id={event.track_id}")
@@ -586,7 +711,8 @@ class CameraWorker:
                         frame_number=self.frame_count,
                         snapshot_path=snapshot_path,
                         event_data=event_data,
-                        camera_name=self.config.camera_name
+                        camera_name=self.config.camera_name,
+                        geofence_context=self.config.geofence_context
                     )
                     
                     if event_id:
@@ -654,7 +780,8 @@ class CameraWorker:
                             frame_number=self.frame_count,
                             snapshot_path=snapshot_path,
                             event_data=event_data,
-                            camera_name=self.config.camera_name
+                            camera_name=self.config.camera_name,
+                            geofence_context=self.config.geofence_context
                         )
                         
                         if event_id:
@@ -687,10 +814,13 @@ class CameraWorker:
                         frame_number=self.frame_count,
                         snapshot_path=snapshot_path,
                         event_data=event_data,
-                        camera_name=self.config.camera_name
+                        camera_name=self.config.camera_name,
+                        geofence_context=self.config.geofence_context
                     )
                     
+                    
                     if event_id:
+                        self.analytics_event_detected = True
                         detection_count = len(garbage_event.detections)
                         logger.info(f"Camera {self.camera_id}: Saved and published garbage detection event with {detection_count} detections (event_id={event_id}) in {garbage_time:.3f}s")
                     else:
@@ -768,7 +898,8 @@ class CameraWorker:
                     frame_number=self.frame_count,
                     snapshot_path=snapshot_path,
                     event_data=event_data,
-                    camera_name=self.config.camera_name
+                    camera_name=self.config.camera_name,
+                    geofence_context=self.config.geofence_context
                 )
                 
                 if event_id:
@@ -807,8 +938,13 @@ class CameraManager:
         
         with self.lock:
             if config.camera_id in self.workers:
-                logger.warning(f"CameraManager: Camera {config.camera_id} already exists")
-                return False
+                logger.info(f"CameraManager: Camera {config.camera_id} already exists, restarting to apply new config")
+                try:
+                    old_worker = self.workers[config.camera_id]
+                    old_worker.stop()
+                    del self.workers[config.camera_id]
+                except Exception as e:
+                    logger.error(f"Failed to stop existing camera {config.camera_id}: {e}")
             
             try:
                 logger.debug(f"CameraManager: Creating worker for camera {config.camera_id}")

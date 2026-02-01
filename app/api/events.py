@@ -77,6 +77,8 @@ async def list_events(
     object_class: Optional[str] = Query(None, description="Filter by object class (e.g., person, car, truck, garbage)"),
     license_plate: Optional[str] = Query(None, description="Filter by license plate (supports regex pattern)"),
     min_confidence: Optional[float] = Query(None, ge=0.0, le=1.0, description="Minimum confidence threshold (0.0-1.0). Works for tracking and ANPR events. For detection events, checks if any detection meets the threshold."),
+    signal_type: Optional[str] = Query(None, description="Filter by geofence signal type (rfid, geofence)"),
+    signal_id: Optional[str] = Query(None, description="Filter by signal ID in geofence context"),
     start_time: Optional[datetime] = Query(None, description="Start timestamp (ISO format)"),
     end_time: Optional[datetime] = Query(None, description="End timestamp (ISO format)"),
     page: int = Query(1, ge=1, description="Page number"),
@@ -94,6 +96,8 @@ async def list_events(
         min_confidence: Minimum confidence threshold (0.0-1.0). For tracking events, filters by event_data->>'confidence'. 
                        For ANPR events, filters by event_data->'anpr_result'->>'confidence'. 
                        For detection events, checks if any detection in the detections array has confidence >= threshold.
+        signal_type: Filter by geofence signal type (rfid, geofence) - searches in event_data->geofence_context->signal_type
+        signal_id: Filter by signal ID in geofence context - searches in event_data->geofence_context->signal_id
         start_time: Start timestamp for filtering
         end_time: End timestamp for filtering
         page: Page number (1-indexed)
@@ -154,6 +158,20 @@ async def list_events(
                 )
             """).bindparams(min_conf=min_confidence)
             filters.append(confidence_filter)
+        if signal_type:
+            # Filter by signal_type in geofence_context within event_data
+            logger.info(f"Adding signal_type filter: '{signal_type}'")
+            filters.append(
+                text("event_data->'geofence_context'->>'signal_type' = :signal_type")
+                .bindparams(signal_type=signal_type)
+            )
+        if signal_id:
+            # Filter by signal_id in geofence_context within event_data
+            logger.info(f"Adding signal_id filter: '{signal_id}'")
+            filters.append(
+                text("event_data->'geofence_context'->>'signal_id' = :signal_id")
+                .bindparams(signal_id=signal_id)
+            )
         if start_time:
             filters.append(EventRecord.timestamp >= start_time)
         if end_time:
