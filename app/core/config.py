@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # YOLO configuration
     yolo_model: str = "/app/weights/general/yolov8m.pt"
     garbage_model: str = "/app/weights/garbage_detection/best.pt"
+    helmet_model: str = "/app/weights/helmet/helmet-best.pt"
+    tripling_model: str = "/app/weights/tripling/tripling-best.pt"
+    seatbelt_model: str = "/app/weights/seatbelt/NoSeatBelt_Best.pt"
     
     # API configuration
     api_host: str = "0.0.0.0"

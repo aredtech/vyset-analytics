@@ -54,7 +54,45 @@ class EventFilter:
         # Track ID deduplication - only emit events for track_id changes
         self.emitted_track_ids: Set[int] = set()  # Track IDs that have already emitted "entered" events
         
+        # Generic manual cooldowns
+        self.manual_cooldowns: Dict[str, float] = {}
+        
+        
+        # Track violations per track_id to prevent duplicates for same vehicle
+        self.active_track_violations: Dict[int, Set[str]] = {}
+        
         logger.info(f"EventFilter initialized for camera {camera_id} (motion_cooldown={motion_cooldown}s, anpr_cooldown={anpr_cooldown}s)")
+    
+    def can_publish(self, key: str, cooldown: float) -> bool:
+        """
+        Generic rate limiter for arbitrary keys.
+        
+        Args:
+            key: Unique identifier for the event
+            cooldown: Cooldown in seconds
+            
+        Returns:
+            True if allowed to publish, False otherwise
+        """
+        current_time = time.time()
+        last_time = self.manual_cooldowns.get(key, 0)
+        
+        if current_time - last_time < cooldown:
+            return False
+            
+        self.manual_cooldowns[key] = current_time
+        
+        # Periodic cleanup (simple check)
+        if len(self.manual_cooldowns) > 1000:
+            self._cleanup_manual_cooldowns(current_time)
+            
+        return True
+
+    def _cleanup_manual_cooldowns(self, current_time: float, max_age: float = 300.0):
+        """Remove old manual cooldown entries."""
+        keys_to_remove = [k for k, t in self.manual_cooldowns.items() if current_time - t > max_age]
+        for k in keys_to_remove:
+            del self.manual_cooldowns[k]
     
     def should_publish_motion(self, event: MotionEvent) -> bool:
         """
@@ -110,6 +148,34 @@ class EventFilter:
         
         return True
     
+    def should_publish_violation(self, track_id: int, violation_type: str) -> bool:
+        """
+        Determine if a violation should be published for a specific track.
+        
+        Ensures that a specific violation type is only published ONCE per track ID.
+        
+        Args:
+            track_id: Tracking ID of the object
+            violation_type: Type of violation (e.g. "no_helmet", "tripling")
+            
+        Returns:
+            True if violation should be published, False otherwise
+        """
+        # Initialize set for this track if not exists
+        if track_id not in self.active_track_violations:
+            self.active_track_violations[track_id] = set()
+            
+        # Check if already published
+        if violation_type in self.active_track_violations[track_id]:
+            vehicle_violations = list(self.active_track_violations[track_id])
+            logger.debug(f"Camera {self.camera_id}: Violation '{violation_type}' already published for track {track_id} (active: {vehicle_violations}) - skipping")
+            return False
+            
+        # Add to set and allow publishing
+        self.active_track_violations[track_id].add(violation_type)
+        logger.info(f"Camera {self.camera_id}: New violation '{violation_type}' for track {track_id} - publishing")
+        return True
+    
     def should_publish_tracking(self, event: TrackingEvent) -> bool:
         """
         Determine if a tracking event should be published.
@@ -145,6 +211,11 @@ class EventFilter:
             
             # Remove from emitted set since object has left
             self.emitted_track_ids.discard(track_id)
+            
+            # Clean up violation state for this track
+            if track_id in self.active_track_violations:
+                del self.active_track_violations[track_id]
+                
             logger.info(f"Camera {self.camera_id}: Tracking event 'left' for {event.class_name} (track_id={track_id}) - publishing")
             return True
             
@@ -180,6 +251,8 @@ class EventFilter:
         """Reset all filter state."""
         self.last_motion_time = 0
         self.last_anpr_times.clear()
+        self.last_anpr_times.clear()
         self.emitted_track_ids.clear()
+        self.active_track_violations.clear()
         logger.info(f"Camera {self.camera_id}: Event filter reset")
 

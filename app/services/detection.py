@@ -62,7 +62,8 @@ class ObjectDetector:
         model_path: Optional[str] = None,
         enable_tracking: bool = True,
         track_buffer_frames: int = 30,
-        min_dwell_time_seconds: float = 1.0
+        min_dwell_time_seconds: float = 1.0,
+        model_instance: Optional[YOLO] = None
     ):
         """
         Initialize YOLO model with tracking.
@@ -72,18 +73,22 @@ class ObjectDetector:
             enable_tracking: Enable object tracking (vs. simple detection)
             track_buffer_frames: Frames to wait before considering object "left"
             min_dwell_time_seconds: Minimum dwell time to trigger "left" event
+            model_instance: Pre-loaded YOLO model instance (optional)
         """
         self.model_path = model_path or settings.yolo_model
         self.enable_tracking = enable_tracking
         self.track_buffer_frames = track_buffer_frames
         self.min_dwell_time_seconds = min_dwell_time_seconds
-        self.model = None
         
         # Tracking state
         self.active_tracks: Dict[int, TrackedObject] = {}
         self.lost_tracks: Dict[int, Tuple[TrackedObject, int]] = {}  # track_id -> (object, frames_since_seen)
         
-        self._load_model()
+        if model_instance:
+            self.model = model_instance
+            logger.info(f"Using shared YOLO model instance")
+        else:
+            self._load_model()
     
     def _load_model(self):
         """Load YOLO model."""

@@ -53,6 +53,10 @@ class CameraParameters(BaseModel):
     
     # Event retention parameters
     retention_days: int = Field(default=30, ge=1, le=365, description="Number of days to retain events for this camera (1-365)")
+    
+    # Violation Configuration
+    violation_config: Dict[str, List[str]] = Field(default_factory=dict, description="Configuration for specific violations (e.g., {'motorcycle': ['helmet', 'tripling'], 'car': ['seatbelt']})")
+    skip_vehicle_event: bool = Field(default=False, description="Skip saving vehicle detection events, only save violations")
 
 
 class CameraConfig(BaseModel):

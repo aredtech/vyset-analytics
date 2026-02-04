@@ -1,28 +1,103 @@
 import cv2
 import threading
-import multiprocessing
 import queue
 import time
 import os
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import urllib.request
 import json
-from app.models.event_models import CameraConfig, CameraStatus, Detection
+from ultralytics import YOLO
+from app.models.event_models import CameraConfig, CameraStatus, Detection, BoundingBox
 from app.models.db_models import EventRecord
 from app.services.detection import ObjectDetector
 from app.services.motion import MotionDetector
 from app.services.anpr import ANPRDetector
-from app.services.garbage_detection import GarbageDetector
+from app.services.garbage_detection import GarbageDetector, GARBAGE_CLASS_NAMES
 from app.services.event_filter import EventFilter
+from app.services.violation_detection import ViolationDetector
 from app.core.redis_client import redis_client, RedisClient
 from app.core.database import get_db_context
 from app.utils.snapshot import snapshot_manager
 from app.utils.logger import get_logger
 
+from app.core.config import get_settings
+
 logger = get_logger(__name__)
+settings = get_settings()
+
+class ModelManager:
+    """
+    Singleton manager for loading and sharing heavy AI models across threads.
+    This prevents each camera thread from loading its own copy of models,
+    significantly reducing memory usage.
+    """
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(ModelManager, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+            
+        self.yolo_model = None
+        self.helmet_model = None
+        self.tripling_model = None
+        self.seatbelt_model = None
+        self.garbage_model = None
+        self._initialized = True
+        logger.info("ModelManager initialized")
+
+    def get_yolo_model(self):
+        """Get or load shared YOLO object detection model."""
+        with self._lock:
+            if self.yolo_model is None:
+                model_path = settings.yolo_model
+                logger.info(f"ModelManager: Loading shared YOLO model from {model_path}")
+                try:
+                    self.yolo_model = YOLO(model_path)
+                    logger.info("ModelManager: Shared YOLO model loaded")
+                except Exception as e:
+                    logger.error(f"ModelManager: Failed to load YOLO model: {e}")
+            return self.yolo_model
+
+    def get_violation_models(self):
+        """Get or load shared violation detection models (helmet, tripling, seatbelt)."""
+        with self._lock:
+            if self.helmet_model is None and os.path.exists(settings.helmet_model):
+                logger.info(f"ModelManager: Loading shared Helmet model from {settings.helmet_model}")
+                try:
+                    self.helmet_model = YOLO(settings.helmet_model)
+                except Exception as e:
+                    logger.error(f"ModelManager: Failed to load Helmet model: {e}")
+            
+            if self.tripling_model is None and os.path.exists(settings.tripling_model):
+                logger.info(f"ModelManager: Loading shared Tripling model from {settings.tripling_model}")
+                try:
+                    self.tripling_model = YOLO(settings.tripling_model)
+                except Exception as e:
+                    logger.error(f"ModelManager: Failed to load Tripling model: {e}")
+            
+            if self.seatbelt_model is None and os.path.exists(settings.seatbelt_model):
+                logger.info(f"ModelManager: Loading shared Seatbelt model from {settings.seatbelt_model}")
+                try:
+                    self.seatbelt_model = YOLO(settings.seatbelt_model)
+                except Exception as e:
+                    logger.error(f"ModelManager: Failed to load Seatbelt model: {e}")
+                    
+            return self.helmet_model, self.tripling_model, self.seatbelt_model
+
+# Global model manager
+model_manager = ModelManager()
 
 # Set environment variable to force RTSP over TCP for better reliability
 # This helps avoid UDP packet loss and timeout issues
@@ -302,7 +377,7 @@ def save_and_publish_event(
         return None
 
 
-class CameraWorker:
+class CameraWorker(threading.Thread):
     """Worker thread for processing a single camera stream."""
     
     def __init__(self, config: CameraConfig):
@@ -312,6 +387,7 @@ class CameraWorker:
         Args:
             config: Camera configuration
         """
+        super().__init__(daemon=True)  # Initialize threading.Thread
         logger.debug(f"Initializing CameraWorker for camera {config.camera_id}")
         
         self.config = config
@@ -323,9 +399,9 @@ class CameraWorker:
             logger.info(f"Camera {config.camera_id}: Replaced localhost with mediamtx in stream URL. Old: {old_url}, New: {self.config.stream_url}")
             
         self.camera_id = config.camera_id
-        # Use multiprocessing Event for stopping
-        self.stop_event = multiprocessing.Event()
-        self.process = None  # Renamed from thread
+        # Use threading Event for stopping
+        self.stop_event = threading.Event()
+        # self.process = None  # No longer used
         self.cap = None
         self.frame_count = 0
         self.mandatory_event_saved = False
@@ -346,6 +422,7 @@ class CameraWorker:
         self.motion_detector = None
         self.anpr_detector = None
         self.garbage_detector = None
+        self.violation_detector = None
         
     def _init_detectors(self):
         """Initialize detectors inside the process."""
@@ -355,10 +432,14 @@ class CameraWorker:
         
         if config.parameters.enable_object_detection:
             logger.debug(f"Camera {self.camera_id}: Creating ObjectDetector with tracking")
+            # Get shared model instance
+            shared_yolo = model_manager.get_yolo_model()
+            
             self.object_detector = ObjectDetector(
                 enable_tracking=config.parameters.enable_object_tracking,
                 track_buffer_frames=config.parameters.track_buffer_frames,
-                min_dwell_time_seconds=config.parameters.min_dwell_time_seconds
+                min_dwell_time_seconds=config.parameters.min_dwell_time_seconds,
+                model_instance=shared_yolo
             )
             logger.debug(f"Camera {self.camera_id}: ObjectDetector initialized with tracking={config.parameters.enable_object_tracking}")
         
@@ -389,46 +470,59 @@ class CameraWorker:
             logger.info(f"Camera {self.camera_id}: ANPR is disabled (enable_anpr=False)")
             self.anpr_detector = None
         
+            self.anpr_detector = None
+            
+        # Initialize ViolationDetector if there are any violation configs
+        if config.parameters.violation_config:
+            logger.info(f"Camera {self.camera_id}: Initializing ViolationDetector with config: {config.parameters.violation_config}")
+            try:
+                # Get shared violation models
+                helmet_model, tripling_model, seatbelt_model = model_manager.get_violation_models()
+                
+                self.violation_detector = ViolationDetector(
+                    helmet_model_instance=helmet_model,
+                    tripling_model_instance=tripling_model,
+                    seatbelt_model_instance=seatbelt_model
+                )
+                logger.info(f"Camera {self.camera_id}: ViolationDetector initialized successfully")
+            except Exception as e:
+                logger.error(f"Camera {self.camera_id}: Failed to initialize ViolationDetector: {e}")
+                self.violation_detector = None
+        
         logger.info(f"Camera {self.camera_id}: CameraWorker initialized successfully (stream_url={config.stream_url})")
     
     def start(self):
-        """Start the camera processing process."""
+        """Start the camera processing thread."""
         logger.debug(f"Camera {self.camera_id}: start() called")
         
-        if self.process and self.process.is_alive():
+        if self.is_alive():
             logger.warning(f"Camera {self.camera_id} is already running")
             return
             
         # Reset stop event
         self.stop_event.clear()
         
-        logger.debug(f"Camera {self.camera_id}: Creating processing process")
-        # Use multiprocessing.Process instead of threading.Thread
-        self.process = multiprocessing.Process(target=self._process_stream, daemon=True)
-        self.process.start()
-        logger.info(f"Camera {self.camera_id}: Started camera worker process (pid={self.process.pid})")
-    
+        logger.info(f"Camera {self.camera_id}: Starting camera worker thread")
+        super().start()  # Start the thread
+
     def stop(self):
-        """Stop the camera processing process."""
+        """Stop the camera processing thread."""
         logger.debug(f"Camera {self.camera_id}: stop() called")
         
-        if not self.process:
-            logger.debug(f"Camera {self.camera_id}: Already stopped (no process)")
+        if not self.is_alive():
+            logger.debug(f"Camera {self.camera_id}: Already stopped")
             return
         
         logger.info(f"Camera {self.camera_id}: Stopping camera worker...")
         self.stop_event.set()
         
-        if self.process:
-            logger.debug(f"Camera {self.camera_id}: Waiting for process to join (timeout=5s)")
-            self.process.join(timeout=5)
-            if self.process.is_alive():
-                logger.warning(f"Camera {self.camera_id}: Process did not stop within timeout, terminating...")
-                self.process.terminate()
-            else:
-                logger.debug(f"Camera {self.camera_id}: Process stopped successfully")
-            
-            self.process = None
+        logger.debug(f"Camera {self.camera_id}: Waiting for thread to join (timeout=5s)")
+        self.join(timeout=5)
+        
+        if self.is_alive():
+             logger.warning(f"Camera {self.camera_id}: Thread did not stop within timeout")
+        else:
+             logger.debug(f"Camera {self.camera_id}: Thread stopped successfully")
         
         if self.cap:
             logger.debug(f"Camera {self.camera_id}: Releasing video capture")
@@ -508,31 +602,14 @@ class CameraWorker:
             return False
     
     
-    def _process_stream(self):
+    def run(self):
         """Main processing loop for camera stream."""
-        # Re-initialize global singletons for this separate process
-        # This is CRITICAL because:
-        # 1. Threads (BackgroundEventProcessor) are NOT copied to child processes on fork/spawn
-        # 2. Redis sockets should NOT be shared across processes
-        global event_processor, redis_client
+        # Note: We are now in a Thread, so we share global state with the main process.
+        # No need to re-initialize Redis or EventProcessor.
         
-        print(f"DEBUG: _process_stream running in PID {os.getpid()}")
-        logger.info(f"Camera {self.camera_id}: Re-initializing global state in child process {os.getpid()}")
+        logger.info(f"Camera {self.camera_id}: Worker thread started")
         
-        # 1. Re-init Redis Client
-        # The old global object exists but points to a socket in the parent process.
-        # We overwrite the global variable in THIS process only.
-        redis_client = RedisClient()
-        logger.info(f"Camera {self.camera_id}: RedisClient re-initialized")
-        
-        # 2. Re-init Event Processor
-        # The old global object exists but its thread is DEAD (if fork) or missing.
-        # We create a new one for this process.
-        event_processor = BackgroundEventProcessor()
-        event_processor.start()
-        logger.info(f"Camera {self.camera_id}: BackgroundEventProcessor re-initialized and started")
-        
-        # Initialize detectors in the new process
+        # Initialize detectors (now using shared models)
         self._init_detectors()
         
         # Retry connection every 10 seconds until successful
@@ -699,11 +776,8 @@ class CameraWorker:
             except:
                 pass
         
-        # Stop local event processor
-        if 'event_processor' in globals() and event_processor:
-            logger.info(f"Camera {self.camera_id}: Stopping local event processor")
-            event_processor.stop()
-            event_processor.join(timeout=2)
+        # We DO NOT stop the global event processor here because other threads might be using it.
+        # The event processor is now shared.
     
     def _process_frame(self, frame):
         """
@@ -794,11 +868,23 @@ class CameraWorker:
             
             # Save and publish all tracking events (entered/left) to database and Redis Pub/Sub
             if tracking_events:
+                # Check skip_vehicle_event once for efficiency
+                params = self.config.parameters
+                skip_vehicle_event = getattr(params, 'skip_vehicle_event', False) if hasattr(params, 'skip_vehicle_event') else params.get('skip_vehicle_event', False) if isinstance(params, dict) else False
+                logger.info(f"Camera {self.camera_id}: skip_vehicle_event={skip_vehicle_event}")
+                
                 for event in tracking_events:
                     # Apply tracking event filtering to prevent duplicates
                     if not self.event_filter.should_publish_tracking(event):
                         logger.debug(f"Camera {self.camera_id}: Tracking event filtered out for track_id={event.track_id}, action={event.tracking_action}")
                         continue
+                    
+                    # Skip vehicle tracking events if skip_vehicle_event is enabled
+                    # Only violation events will be saved for vehicles
+                    if skip_vehicle_event and event.class_name.lower() in VEHICLE_CLASSES:
+                        logger.info(f"Camera {self.camera_id}: Skipping vehicle tracking event for {event.class_name} (track_id={event.track_id}) - skip_vehicle_event enabled")
+                        continue
+
                     
                     # Save snapshot (only for important events: entered and left)
                     snapshot_path = None
@@ -848,6 +934,120 @@ class CameraWorker:
                         logger.error(f"Camera {self.camera_id}: Failed to save tracking event for track_id={event.track_id}")
             else:
                 logger.debug(f"Camera {self.camera_id}: No tracking events in frame #{self.frame_count} ({detect_time:.3f}s)")
+        
+            # Check active tracks for VIOLATIONS (Helmet/Tripling)
+            # We only check tracks that are currently active in this frame
+            if self.violation_detector and self.object_detector and hasattr(self.object_detector, 'active_tracks'):
+                violation_config = self.config.parameters.violation_config
+                logger.info(f"Camera {self.camera_id}: Checking active tracks for violations")
+                logger.info(f"Camera {self.camera_id}: Active tracks: {self.config.parameters.violation_config}")
+                
+                # Check each active track
+                for track_id, tracked_obj in self.object_detector.active_tracks.items():
+                    class_name = tracked_obj.class_name.lower()
+                    
+                    # Only proceed if we have config for this class
+                    if class_name in violation_config: # e.g. "motorcycle"
+                        needed_checks = violation_config[class_name] # e.g. ["helmet", "tripling"]
+                        
+                        # Only check periodically or on specific conditions to save compute?
+                        # For now, check every 10th frame per object to avoid spamming inference? 
+                        # Or better: check only if we haven't detected a violation for this object recently?
+                        # Let's check every 5 frames for responsiveness.
+                        if self.frame_count % 5 != 0:
+                            continue
+                            
+                        # Get object crop
+                        # Retrieve latest bbox from tracked_obj
+                        if not tracked_obj.positions:
+                            continue
+                        
+                        bbox = tracked_obj.positions[-1]
+                        
+                        # Convert bbox object to list [x, y, w, h]
+                        bbox_list = [bbox.x, bbox.y, bbox.width, bbox.height]
+                        
+                        # Run checks
+                        violations_found = []
+                        
+                        if "helmet" in needed_checks:
+                            is_violation, conf, label = self.violation_detector.check_helmet(frame, bbox_list)
+                            if is_violation:
+                                violations_found.append({"type": "no_helmet", "confidence": conf})
+                                
+                        if "tripling" in needed_checks:
+                            is_violation, conf, label = self.violation_detector.check_tripling(frame, bbox_list)
+                            if is_violation:
+                                violations_found.append({"type": "tripling", "confidence": conf})
+                        
+                        if "seatbelt" in needed_checks:
+                            is_violation, conf, label = self.violation_detector.check_seatbelt(frame, bbox_list)
+                            if is_violation:
+                                violations_found.append({"type": "no_seatbelt", "confidence": conf})
+                                
+                        # If violations found, generate event
+                        if violations_found:
+                            # We need to rate limit this per track_id so we don't spam 30 events a second
+                            # Using a simple cache in this loop isn't enough, we need state on the worker
+                            # For simplicity, let's use the EventFilter but add a custom key for violations
+                            
+                            for v in violations_found:
+                                v_type = v["type"]
+                                
+                                # Use track-based deduplication (only one event per violation type per track)
+                                if self.event_filter.should_publish_violation(track_id, v_type):
+                                    logger.info(f"Camera {self.camera_id}: Detected {v_type} on {class_name} (track_id={track_id})")
+                                    
+                                    # Create snapshot for violation
+                                    # Calculate padded bbox for snapshot to ensure violation is visible (add 10% padding)
+                                    pad_x = bbox.width * 0.2
+                                    pad_y = bbox.height * 0.2
+                                    
+                                    x1 = max(0.0, bbox.x - pad_x)
+                                    y1 = max(0.0, bbox.y - pad_y)
+                                    x2 = min(1.0, bbox.x + bbox.width + pad_x)
+                                    y2 = min(1.0, bbox.y + bbox.height + pad_y)
+                                    
+                                    padded_bbox = BoundingBox(
+                                        x=x1,
+                                        y=y1,
+                                        width=x2 - x1,
+                                        height=y2 - y1
+                                    )
+
+                                    # Create a Detection object for snapshot visualization
+                                    violation_detection = Detection(
+                                        class_name=f"{class_name} ({v_type})",
+                                        confidence=v["confidence"],
+                                        bounding_box=padded_bbox,
+                                        track_id=track_id
+                                    )
+                                    
+                                    snapshot_path = snapshot_manager.save_detection_snapshot(
+                                        frame=frame,
+                                        camera_id=self.camera_id,
+                                        detections=[violation_detection],
+                                        timestamp=datetime.utcnow()
+                                    )
+                                    
+                                    event_data = {
+                                        "violation_type": v_type,
+                                        "class_name": class_name,
+                                        "track_id": track_id,
+                                        "confidence": v["confidence"],
+                                        "bbox": bbox.dict()
+                                    }
+                                    
+                                    save_and_publish_event(
+                                        event_type=v_type,
+                                        camera_id=self.camera_id,
+                                        timestamp=datetime.utcnow().isoformat() + "Z",
+                                        frame_number=self.frame_count,
+                                        snapshot_path=snapshot_path,
+                                        event_data=event_data,
+                                        camera_name=self.config.camera_name,
+                                        geofence_context=self.config.geofence_context
+                                    )
         
         # Motion detection
         if self.motion_detector and self.config.parameters.enable_motion_detection:
@@ -899,8 +1099,12 @@ class CameraWorker:
             else:
                 logger.debug(f"Camera {self.camera_id}: No motion detected in frame #{self.frame_count} ({motion_time:.3f}s)")
         
+        
+        # Check if any garbage class is in detection_classes
+        is_garbage_enabled_in_classes = any(cls.lower() in [c.lower() for c in self.config.parameters.detection_classes] for cls in GARBAGE_CLASS_NAMES)
+
         # Garbage detection
-        if self.garbage_detector and self.config.parameters.enable_garbage_detection:
+        if self.garbage_detector and self.config.parameters.enable_garbage_detection and is_garbage_enabled_in_classes:
             logger.debug(f"Camera {self.camera_id}: Running garbage detection on frame #{self.frame_count}")
             garbage_start = time.time()
             garbage_result = self.garbage_detector.detect(

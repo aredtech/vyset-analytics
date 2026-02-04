@@ -29,6 +29,7 @@ class RetentionScheduler:
         self.running = False
         self.thread = None
         self.last_cleanup = None
+        self.stop_event = threading.Event()
         
         logger.info(f"RetentionScheduler initialized with {cleanup_interval_hours}h interval")
     
@@ -40,6 +41,7 @@ class RetentionScheduler:
         
         logger.info("Starting RetentionScheduler")
         self.running = True
+        self.stop_event.clear()
         self.thread = threading.Thread(target=self._run_scheduler, daemon=True)
         self.thread.start()
         logger.info("RetentionScheduler started successfully")
@@ -52,39 +54,16 @@ class RetentionScheduler:
         
         logger.info("Stopping RetentionScheduler")
         self.running = False
+        self.stop_event.set()
         
         if self.thread:
-            self.thread.join(timeout=10)
+            # We can use a much shorter join timeout now
+            self.thread.join(timeout=2)
             if self.thread.is_alive():
                 logger.warning("RetentionScheduler thread did not stop within timeout")
             else:
                 logger.info("RetentionScheduler stopped successfully")
-    
-    def _run_scheduler(self):
-        """Main scheduler loop."""
-        logger.info("RetentionScheduler thread started")
-        
-        # Run initial cleanup after a short delay
-        time.sleep(30)  # Wait 30 seconds for system to stabilize
-        
-        while self.running:
-            try:
-                # Check if it's time for cleanup
-                if self._should_run_cleanup():
-                    logger.info("Starting scheduled retention cleanup")
-                    self._run_cleanup()
-                    self.last_cleanup = datetime.utcnow()
-                    logger.info("Scheduled retention cleanup completed")
-                
-                # Sleep for a shorter interval to check more frequently
-                time.sleep(300)  # Check every 5 minutes
-                
-            except Exception as e:
-                logger.error(f"Error in retention scheduler: {e}", exc_info=True)
-                time.sleep(60)  # Wait 1 minute before retrying
-        
-        logger.info("RetentionScheduler thread stopped")
-    
+
     def _should_run_cleanup(self) -> bool:
         """
         Check if cleanup should run based on interval.
@@ -97,6 +76,38 @@ class RetentionScheduler:
         
         time_since_last = datetime.utcnow() - self.last_cleanup
         return time_since_last.total_seconds() >= self.cleanup_interval_seconds
+    
+    def _run_scheduler(self):
+        """Main scheduler loop."""
+        logger.info("RetentionScheduler thread started")
+        
+        # Run initial cleanup after a short delay
+        # Use wait() on stop_event instead of sleep to allow immediate stop
+        if self.stop_event.wait(timeout=30):
+             logger.info("RetentionScheduler thread stopped during initial delay")
+             return
+        
+        while self.running and not self.stop_event.is_set():
+            try:
+                # Check if it's time for cleanup
+                if self._should_run_cleanup():
+                    logger.info("Starting scheduled retention cleanup")
+                    self._run_cleanup()
+                    self.last_cleanup = datetime.utcnow()
+                    logger.info("Scheduled retention cleanup completed")
+                
+                # Sleep for a shorter interval to check more frequently
+                # Wait for 300s (5m) or until stop_event is set
+                if self.stop_event.wait(timeout=300):
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error in retention scheduler: {e}", exc_info=True)
+                # Wait 1 minute before retrying
+                if self.stop_event.wait(timeout=60):
+                    break
+        
+        logger.info("RetentionScheduler thread stopped")
     
     def _run_cleanup(self):
         """Run the retention cleanup process."""
