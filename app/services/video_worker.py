@@ -970,21 +970,45 @@ class CameraWorker(threading.Thread):
                         # Run checks
                         violations_found = []
                         
+                        
+                        # Seatbelt check (runs on cropped vehicle image)
+                        if "seatbelt" in needed_checks:
+                            # Create crop for seatbelt detection with padding (20%)
+                            h, w = frame.shape[:2]
+                            
+                            pad_w = 0.2 * bbox.width
+                            pad_h = 0.2 * bbox.height
+                            
+                            x1 = int(max(0, (bbox.x - pad_w) * w))
+                            y1 = int(max(0, (bbox.y - pad_h) * h))
+                            x2 = int(min(w, (bbox.x + bbox.width + pad_w) * w))
+                            y2 = int(min(h, (bbox.y + bbox.height + pad_h) * h))
+                            
+                            # Safety check for valid crop
+                            if x2 > x1 and y2 > y1:
+                                vehicle_crop = frame[y1:y2, x1:x2]
+                                if vehicle_crop.size > 0:
+                                    # Pass crop to seatbelt detector with bbox=None (implies full crop is the vehicle)
+                                    is_violation, conf, label = self.violation_detector.check_seatbelt(vehicle_crop, bbox=None)
+                                    if is_violation:
+                                        violations_found.append({
+                                            "type": "no_seatbelt", 
+                                            "confidence": conf
+                                            # "crop": vehicle_crop  <-- Removed to force full frame snapshot
+                                        })
+                            
+                        # Helmet check (runs on full frame)
                         if "helmet" in needed_checks:
                             is_violation, conf, label = self.violation_detector.check_helmet(frame, bbox_list)
                             if is_violation:
                                 violations_found.append({"type": "no_helmet", "confidence": conf})
                                 
+                        # Tripling check (runs on full frame)
                         if "tripling" in needed_checks:
                             is_violation, conf, label = self.violation_detector.check_tripling(frame, bbox_list)
                             if is_violation:
                                 violations_found.append({"type": "tripling", "confidence": conf})
                         
-                        if "seatbelt" in needed_checks:
-                            is_violation, conf, label = self.violation_detector.check_seatbelt(frame, bbox_list)
-                            if is_violation:
-                                violations_found.append({"type": "no_seatbelt", "confidence": conf})
-                                
                         # If violations found, generate event
                         if violations_found:
                             # We need to rate limit this per track_id so we don't spam 30 events a second
@@ -999,32 +1023,42 @@ class CameraWorker(threading.Thread):
                                     logger.info(f"Camera {self.camera_id}: Detected {v_type} on {class_name} (track_id={track_id})")
                                     
                                     # Create snapshot for violation
-                                    # Calculate padded bbox for snapshot to ensure violation is visible (add 10% padding)
-                                    pad_x = bbox.width * 0.2
-                                    pad_y = bbox.height * 0.2
+                                    # Check if we have a specific crop for this violation (Seatbelt)
+                                    detection_frame = v.get("crop")
                                     
-                                    x1 = max(0.0, bbox.x - pad_x)
-                                    y1 = max(0.0, bbox.y - pad_y)
-                                    x2 = min(1.0, bbox.x + bbox.width + pad_x)
-                                    y2 = min(1.0, bbox.y + bbox.height + pad_y)
-                                    
-                                    padded_bbox = BoundingBox(
-                                        x=x1,
-                                        y=y1,
-                                        width=x2 - x1,
-                                        height=y2 - y1
-                                    )
+                                    if detection_frame is not None:
+                                        # Use the crop as the snapshot
+                                        # The detection box is the entire crop
+                                        formatted_bbox = BoundingBox(x=0.0, y=0.0, width=1.0, height=1.0)
+                                        snapshot_frame = detection_frame
+                                    else:
+                                        # Standard Logic: Use full frame and calculate padded bbox
+                                        pad_x = bbox.width * 0.2
+                                        pad_y = bbox.height * 0.2
+                                        
+                                        x1 = max(0.0, bbox.x - pad_x)
+                                        y1 = max(0.0, bbox.y - pad_y)
+                                        x2 = min(1.0, bbox.x + bbox.width + pad_x)
+                                        y2 = min(1.0, bbox.y + bbox.height + pad_y)
+                                        
+                                        formatted_bbox = BoundingBox(
+                                            x=x1,
+                                            y=y1,
+                                            width=x2 - x1,
+                                            height=y2 - y1
+                                        )
+                                        snapshot_frame = frame
 
                                     # Create a Detection object for snapshot visualization
                                     violation_detection = Detection(
                                         class_name=f"{class_name} ({v_type})",
                                         confidence=v["confidence"],
-                                        bounding_box=padded_bbox,
+                                        bounding_box=formatted_bbox,
                                         track_id=track_id
                                     )
                                     
                                     snapshot_path = snapshot_manager.save_detection_snapshot(
-                                        frame=frame,
+                                        frame=snapshot_frame,
                                         camera_id=self.camera_id,
                                         detections=[violation_detection],
                                         timestamp=datetime.utcnow()
