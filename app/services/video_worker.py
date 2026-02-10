@@ -435,11 +435,17 @@ class CameraWorker(threading.Thread):
             # Get shared model instance
             shared_yolo = model_manager.get_yolo_model()
             
+            # Create thread-local shallow copy to isolate tracking state
+            # This shares the heavy model weights but keeps the predictor/tracker separate
+            local_yolo = copy.copy(shared_yolo)
+            if hasattr(local_yolo, 'predictor'):
+                local_yolo.predictor = None
+            
             self.object_detector = ObjectDetector(
                 enable_tracking=config.parameters.enable_object_tracking,
                 track_buffer_frames=config.parameters.track_buffer_frames,
                 min_dwell_time_seconds=config.parameters.min_dwell_time_seconds,
-                model_instance=shared_yolo
+                model_instance=local_yolo
             )
             logger.debug(f"Camera {self.camera_id}: ObjectDetector initialized with tracking={config.parameters.enable_object_tracking}")
         

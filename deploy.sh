@@ -12,7 +12,7 @@ IMAGE_NAME="vms-analytics"
 VERSION=${1:-latest}  # Use first argument as version, default to 'latest'
 FULL_IMAGE_NAME="${DOCKER_NAMESPACE}/${IMAGE_NAME}:${VERSION}"
 CONTAINER_NAME="analytics-service"
-COMPOSE_FILE="docker-compose.yml"
+COMPOSE_FILE="docker-compose.prod.yml"
 
 # Detect CPU architecture for multi-platform image pull (AMD64 / ARM64)
 ARCH=$(uname -m)
@@ -44,7 +44,7 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-# Check if docker-compose.yml exists
+# Check if docker-compose.prod.yml exists
 if [ ! -f "${COMPOSE_FILE}" ]; then
     echo "❌ Error: ${COMPOSE_FILE} not found."
     exit 1
@@ -71,6 +71,7 @@ docker container prune -f || true
 
 # Start the new container
 echo "🚀 Starting new container..."
+export IMAGE_TAG="${VERSION}"
 docker-compose -f "${COMPOSE_FILE}" up -d
 
 if [ $? -eq 0 ]; then

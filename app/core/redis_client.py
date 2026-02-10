@@ -13,7 +13,12 @@ class RedisClient:
     
     def __init__(self):
         self._client = None
-        self._connect()
+        self._connected = False
+    
+    def _ensure_connected(self):
+        """Ensure Redis connection is established (lazy initialization)."""
+        if self._client is None or not self._connected:
+            self._connect()
     
     def _connect(self):
         """Establish connection to Redis."""
@@ -22,7 +27,9 @@ class RedisClient:
                 "host": settings.redis_host,
                 "port": settings.redis_port,
                 "db": settings.redis_db,
-                "decode_responses": True
+                "decode_responses": True,
+                "socket_connect_timeout": 5,
+                "socket_timeout": 5
             }
             # Add password if configured
             if settings.redis_password:
@@ -30,9 +37,12 @@ class RedisClient:
             
             self._client = redis.Redis(**connection_kwargs)
             self._client.ping()
+            self._connected = True
             logger.info(f"Connected to Redis at {settings.redis_host}:{settings.redis_port}")
         except Exception as e:
+            self._connected = False
             logger.error(f"Failed to connect to Redis: {e}")
+            # Don't raise - allow app to start without Redis
             raise
     
     def publish_event(self, event_data: Dict[str, Any]) -> int:
@@ -46,6 +56,7 @@ class RedisClient:
             Number of subscribers that received the message
         """
         try:
+            self._ensure_connected()
             num_subscribers = self._client.publish(
                 settings.redis_channel_name,
                 json.dumps(event_data)
@@ -54,14 +65,17 @@ class RedisClient:
             return num_subscribers
         except Exception as e:
             logger.error(f"Failed to publish event: {e}")
+            self._connected = False  # Mark as disconnected for retry
             raise
     
     def health_check(self) -> bool:
         """Check if Redis connection is healthy."""
         try:
+            self._ensure_connected()
             return self._client.ping()
         except Exception as e:
             logger.error(f"Redis health check failed: {e}")
+            self._connected = False
             return False
     
     def close(self):
@@ -71,6 +85,6 @@ class RedisClient:
             logger.info("Redis connection closed")
 
 
-# Global Redis client instance
+# Global Redis client instance (lazy initialization - connects on first use)
 redis_client = RedisClient()
 

@@ -1,0 +1,20 @@
+services:
+  analytics-service:
+    image: dockared/vms-analytics:${IMAGE_TAG:-latest}
+    container_name: analytics-service
+    env_file: .env
+    ports:
+      - "8069:8069"
+    restart: unless-stopped
+    volumes:
+      - analytics_snapshots:/app/snapshots
+    networks:
+      - vms_network
+
+volumes:
+  analytics_snapshots:
+    driver: local
+
+networks:
+  vms_network:
+    external: true
