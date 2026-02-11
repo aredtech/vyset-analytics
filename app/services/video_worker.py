@@ -960,7 +960,9 @@ class CameraWorker(threading.Thread):
                 active_tracks = self.object_detector.active_tracks
                 active_track_ids = list(active_tracks.keys())
                 
-                logger.info(f"Camera {self.camera_id}: Checking active tracks for violations (count={len(active_track_ids)})")
+                # Debug: Show WHICH classes are active
+                active_classes = [t.class_name for t in active_tracks.values()]
+                logger.info(f"Camera {self.camera_id}: Checking active tracks: {active_classes} (count={len(active_track_ids)})")
                 
                 # 1. Determine which global checks are needed for this frame
                 need_helmet_check = False

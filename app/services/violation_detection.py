@@ -94,7 +94,7 @@ class ViolationDetector:
                     unique_labels = set()
                     for i in range(len(boxes)):
                         unique_labels.add(model.names[int(boxes.cls[i])])
-                    logger.debug(f"DEBUG: {model_type} model found classes in frame: {unique_labels}")
+                    logger.info(f"DEBUG: {model_type} model found classes in frame: {unique_labels}")
 
                 for i in range(len(boxes)):
                     cls_id = int(boxes.cls[i])
@@ -104,7 +104,7 @@ class ViolationDetector:
                     
                     # Log potential candidates even if confidence is low, for debugging
                     if label == target_label:
-                         logger.debug(f"DEBUG: Found {label} with confidence {conf:.2f} at {det_box}")
+                         logger.info(f"DEBUG: Found {label} with confidence {conf:.2f} at {det_box}")
 
                     if label == target_label and conf > 0.3:
                         detections.append({
