@@ -89,12 +89,23 @@ class ViolationDetector:
             for result in results:
                 boxes = result.boxes
                 
+                # DEBUG: Log all detected classes to verify mapping
+                if len(boxes) > 0:
+                    unique_labels = set()
+                    for i in range(len(boxes)):
+                        unique_labels.add(model.names[int(boxes.cls[i])])
+                    logger.debug(f"DEBUG: {model_type} model found classes in frame: {unique_labels}")
+
                 for i in range(len(boxes)):
                     cls_id = int(boxes.cls[i])
                     conf = float(boxes.conf[i])
                     label = model.names[cls_id]
                     det_box = boxes.xyxy[i].tolist() # [x1, y1, x2, y2]
                     
+                    # Log potential candidates even if confidence is low, for debugging
+                    if label == target_label:
+                         logger.debug(f"DEBUG: Found {label} with confidence {conf:.2f} at {det_box}")
+
                     if label == target_label and conf > 0.3:
                         detections.append({
                             "box": det_box,
