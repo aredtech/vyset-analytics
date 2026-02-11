@@ -943,23 +943,49 @@ class CameraWorker(threading.Thread):
         
             # Check active tracks for VIOLATIONS (Helmet/Tripling)
             # We only check tracks that are currently active in this frame
+            # Check active tracks for VIOLATIONS (Helmet/Tripling)
+            # We only check tracks that are currently active in this frame
             if self.violation_detector and self.object_detector and hasattr(self.object_detector, 'active_tracks'):
                 violation_config = self.config.parameters.violation_config
-                logger.info(f"Camera {self.camera_id}: Checking active tracks for violations")
-                logger.info(f"Camera {self.camera_id}: Active tracks: {self.config.parameters.violation_config}")
+                active_tracks = self.object_detector.active_tracks
+                active_track_ids = list(active_tracks.keys())
                 
-                # Check each active track
-                for track_id, tracked_obj in self.object_detector.active_tracks.items():
+                logger.info(f"Camera {self.camera_id}: Checking active tracks for violations (count={len(active_track_ids)})")
+                
+                # 1. Determine which global checks are needed for this frame
+                need_helmet_check = False
+                need_tripling_check = False
+                
+                for track_id, tracked_obj in active_tracks.items():
+                    class_name = tracked_obj.class_name.lower()
+                    if class_name in violation_config:
+                        checks = violation_config[class_name]
+                        if "helmet" in checks:
+                            need_helmet_check = True
+                        if "tripling" in checks:
+                            need_tripling_check = True
+                            
+                # 2. Run batch inference ONCE per frame if needed
+                helmet_detections = []
+                tripling_detections = []
+                
+                # Optimization: Only run inference when we actually check logic (every 5th frame)
+                if self.frame_count % 5 == 0:
+                    if need_helmet_check:
+                        helmet_detections = self.violation_detector.detect_violations(frame, "helmet")
+                        
+                    if need_tripling_check:
+                        tripling_detections = self.violation_detector.detect_violations(frame, "tripling")
+                
+                # 3. Check each active track against detections
+                for track_id, tracked_obj in active_tracks.items():
                     class_name = tracked_obj.class_name.lower()
                     
                     # Only proceed if we have config for this class
                     if class_name in violation_config: # e.g. "motorcycle"
                         needed_checks = violation_config[class_name] # e.g. ["helmet", "tripling"]
                         
-                        # Only check periodically or on specific conditions to save compute?
-                        # For now, check every 10th frame per object to avoid spamming inference? 
-                        # Or better: check only if we haven't detected a violation for this object recently?
-                        # Let's check every 5 frames for responsiveness.
+                        # Rate limiting: check every 5 frames for responsiveness.
                         if self.frame_count % 5 != 0:
                             continue
                             
@@ -970,18 +996,19 @@ class CameraWorker(threading.Thread):
                         
                         bbox = tracked_obj.positions[-1]
                         
-                        # Convert bbox object to list [x, y, w, h]
-                        bbox_list = [bbox.x, bbox.y, bbox.width, bbox.height]
+                        # Prepare bounding box for overlap checks (absolute pixels)
+                        h, w = frame.shape[:2]
+                        moto_x1 = int(max(0, bbox.x * w))
+                        moto_y1 = int(max(0, bbox.y * h))
+                        moto_x2 = int(min(w, (bbox.x + bbox.width) * w))
+                        moto_y2 = int(min(h, (bbox.y + bbox.height) * h))
+                        moto_box = [moto_x1, moto_y1, moto_x2, moto_y2]
                         
-                        # Run checks
                         violations_found = []
                         
-                        
-                        # Seatbelt check (runs on cropped vehicle image)
+                        # Seatbelt check (runs on cropped vehicle image) - keeps per-vehicle logic
                         if "seatbelt" in needed_checks:
                             # Create crop for seatbelt detection with padding (20%)
-                            h, w = frame.shape[:2]
-                            
                             pad_w = 0.2 * bbox.width
                             pad_h = 0.2 * bbox.height
                             
@@ -1000,20 +1027,29 @@ class CameraWorker(threading.Thread):
                                         violations_found.append({
                                             "type": "no_seatbelt", 
                                             "confidence": conf
-                                            # "crop": vehicle_crop  <-- Removed to force full frame snapshot
                                         })
                             
-                        # Helmet check (runs on full frame)
+                        # Helmet check (uses pre-computed full-frame detections)
                         if "helmet" in needed_checks:
-                            is_violation, conf, label = self.violation_detector.check_helmet(frame, bbox_list)
-                            if is_violation:
-                                violations_found.append({"type": "no_helmet", "confidence": conf})
+                            best_conf = 0.0
+                            for det in helmet_detections:
+                                if self.violation_detector._is_overlapping(det["box"], moto_box):
+                                    if det["confidence"] > best_conf:
+                                        best_conf = det["confidence"]
+                            
+                            if best_conf > 0:
+                                violations_found.append({"type": "no_helmet", "confidence": best_conf})
                                 
-                        # Tripling check (runs on full frame)
+                        # Tripling check (uses pre-computed full-frame detections)
                         if "tripling" in needed_checks:
-                            is_violation, conf, label = self.violation_detector.check_tripling(frame, bbox_list)
-                            if is_violation:
-                                violations_found.append({"type": "tripling", "confidence": conf})
+                            best_conf = 0.0
+                            for det in tripling_detections:
+                                if self.violation_detector._is_overlapping(det["box"], moto_box):
+                                    if det["confidence"] > best_conf:
+                                        best_conf = det["confidence"]
+                            
+                            if best_conf > 0:
+                                violations_found.append({"type": "tripling", "confidence": best_conf})
                         
                         # If violations found, generate event
                         if violations_found:
