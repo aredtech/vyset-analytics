@@ -65,7 +65,11 @@ class ModelManager:
                 logger.info(f"ModelManager: Loading shared YOLO model from {model_path}")
                 try:
                     self.yolo_model = YOLO(model_path)
-                    logger.info("ModelManager: Shared YOLO model loaded")
+                    # Fuse the model immediately to prevent race conditions when sharing across threads
+                    # detailed error: AttributeError: 'Conv' object has no attribute 'bn'
+                    logger.info("ModelManager: Fusing YOLO model for thread safety...")
+                    self.yolo_model.fuse()
+                    logger.info("ModelManager: Shared YOLO model loaded and fused")
                 except Exception as e:
                     logger.error(f"ModelManager: Failed to load YOLO model: {e}")
             return self.yolo_model
@@ -77,6 +81,8 @@ class ModelManager:
                 logger.info(f"ModelManager: Loading shared Helmet model from {settings.helmet_model}")
                 try:
                     self.helmet_model = YOLO(settings.helmet_model)
+                    logger.info("ModelManager: Fusing Helmet model...")
+                    self.helmet_model.fuse()
                 except Exception as e:
                     logger.error(f"ModelManager: Failed to load Helmet model: {e}")
             
@@ -84,6 +90,8 @@ class ModelManager:
                 logger.info(f"ModelManager: Loading shared Tripling model from {settings.tripling_model}")
                 try:
                     self.tripling_model = YOLO(settings.tripling_model)
+                    logger.info("ModelManager: Fusing Tripling model...")
+                    self.tripling_model.fuse()
                 except Exception as e:
                     logger.error(f"ModelManager: Failed to load Tripling model: {e}")
             
@@ -91,6 +99,8 @@ class ModelManager:
                 logger.info(f"ModelManager: Loading shared Seatbelt model from {settings.seatbelt_model}")
                 try:
                     self.seatbelt_model = YOLO(settings.seatbelt_model)
+                    logger.info("ModelManager: Fusing Seatbelt model...")
+                    self.seatbelt_model.fuse()
                 except Exception as e:
                     logger.error(f"ModelManager: Failed to load Seatbelt model: {e}")
                     
