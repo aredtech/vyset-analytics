@@ -106,7 +106,7 @@ class ViolationDetector:
                     if label == target_label:
                          logger.info(f"DEBUG: Found {label} with confidence {conf:.2f} at {det_box}")
 
-                    if label == target_label and conf > 0.3:
+                    if label == target_label and conf > 0.2:
                         detections.append({
                             "box": det_box,
                             "confidence": conf,
